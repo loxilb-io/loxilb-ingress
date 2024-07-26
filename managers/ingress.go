@@ -23,7 +23,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -48,25 +47,27 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// Ingress is deleted.
 		if errors.IsNotFound(err) {
 			logger.Info("This resource is deleted", "Ingress", req.NamespacedName)
-			// TODO: when deleted
-			r.LoxiClient.LoadBalancer().DeleteByName(ctx, fmt.Sprintf("%s_%s", req.Namespace, req.Name))
+			ruleName := fmt.Sprintf("%s_%s", req.Namespace, req.Name)
+			if err := r.LoxiClient.LoadBalancer().DeleteByName(ctx, ruleName); err != nil {
+				logger.Error(err, "failed to delete loxilb-ingress rule "+ruleName)
+			}
 			return ctrl.Result{}, nil
 		}
 
-		logger.Error(err, "Failed to get ingress %s/%s", req.Namespace, req.Name)
+		logger.Error(err, "Failed to get ingress", "ingress", ingress)
 		return ctrl.Result{}, err
 	}
 
 	// when ingress is added, install rule to loxilb-ingress
 	models, err := r.createLoxiModelList(ctx, ingress)
 	if err != nil {
-		logger.Error(err, "Failed to set ingress %s/%s. failed to create loxilb loadbalancer model", req.Namespace, req.Name)
+		logger.Error(err, "Failed to set ingress. failed to create loxilb loadbalancer model", "ingress", ingress)
 	}
 
 	for _, model := range models {
 		err = r.LoxiClient.LoadBalancer().Create(ctx, &model)
 		if err != nil {
-			logger.Error(err, "Failed to set ingress %s/%s. failed to install loadbalancer rule to loxilb", req.Namespace, req.Name)
+			logger.Error(err, "Failed to set ingress. failed to install loadbalancer rule to loxilb", "ingress", ingress)
 			return ctrl.Result{}, err
 		}
 	}
@@ -74,14 +75,21 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{}, nil
 }
 
-func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, externalIP string, port int32, host string) loxiapi.LoadBalancerService {
+func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, externalIP string, security int32, host string) loxiapi.LoadBalancerService {
 	service := loxiapi.LoadBalancerService{
 		ExternalIP: externalIP,
 		Protocol:   "tcp",
-		Port:       uint16(port),
 		Mode:       4, // fullproxy mode
 		Name:       fmt.Sprintf("%s_%s", ns, name),
 		Host:       host,
+		Security:   security,
+	}
+
+	// when ingress is set TLS, using https port (443)
+	if security == 0 {
+		service.Port = 80
+	} else {
+		service.Port = 443
 	}
 
 	return service
@@ -94,23 +102,6 @@ func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpoints(ctx context.Co
 		Name:      name,
 	}
 
-	svc := &corev1.Service{}
-	if err := r.Client.Get(ctx, key, svc); err != nil {
-		return loxilbEpList, err
-	}
-
-	targetPort := 0
-	for _, svcPort := range svc.Spec.Ports {
-		if svcPort.Port == port {
-			targetPortNum, err := r.getServicePortIntValue(ctx, svc, svcPort)
-			if err != nil {
-				return loxilbEpList, err
-			}
-			targetPort = targetPortNum
-			break
-		}
-	}
-
 	ep := &corev1.Endpoints{}
 	if err := r.Client.Get(ctx, key, ep); err != nil {
 		return loxilbEpList, err
@@ -120,7 +111,7 @@ func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpoints(ctx context.Co
 		for _, addr := range subset.Addresses {
 			loxilbEp := loxiapi.LoadBalancerEndpoint{
 				EndpointIP: addr.IP,
-				TargetPort: uint16(targetPort),
+				TargetPort: uint16(port),
 				Weight:     uint8(1),
 			}
 			loxilbEpList = append(loxilbEpList, loxilbEp)
@@ -128,30 +119,6 @@ func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpoints(ctx context.Co
 	}
 
 	return loxilbEpList, nil
-}
-
-func (r *LoxilbIngressReconciler) getServicePortIntValue(ctx context.Context, svc *corev1.Service, port corev1.ServicePort) (int, error) {
-	if port.TargetPort.IntValue() != 0 {
-		return port.TargetPort.IntValue(), nil
-	}
-
-	selectorLabel := labels.SelectorFromSet(svc.Spec.Selector)
-	pods := &corev1.PodList{}
-	if err := r.Client.List(ctx, pods, client.InNamespace(svc.Namespace), &client.ListOptions{LabelSelector: selectorLabel}); err != nil {
-		return 0, err
-	}
-
-	for _, pod := range pods.Items {
-		for _, c := range pod.Spec.Containers {
-			for _, p := range c.Ports {
-				if p.Name == port.TargetPort.String() {
-					return int(p.ContainerPort), nil
-				}
-			}
-		}
-	}
-
-	return 0, fmt.Errorf("not found port name %s in service %s", port.TargetPort.String(), svc.Name)
 }
 
 func (r *LoxilbIngressReconciler) checkTlsHost(host string, TLS []netv1.IngressTLS) bool {
@@ -182,12 +149,12 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 				name := path.Backend.Service.Name
 				ns := r.getBackendServiceNamespace(ingress, name)
 				port := path.Backend.Service.Port.Number
-
-				loxisvc := r.createLoxiLoadBalancerService(ns, name, r.LoxiClient.Host, port, rule.Host)
+				security := int32(0)
 				if r.checkTlsHost(rule.Host, ingress.Spec.TLS) {
-					loxisvc.Security = 1
+					security = 1
 				}
 
+				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, ingress.Name, r.LoxiClient.Host, security, rule.Host)
 				loxiep, err := r.createLoxiLoadBalancerEndpoints(ctx, ns, name, port)
 				if err != nil {
 					return models, err
