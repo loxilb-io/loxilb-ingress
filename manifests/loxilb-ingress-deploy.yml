@@ -260,11 +260,6 @@ spec:
         command: [ "/bin/loxilb-ingress" ]
         ports:
         - containerPort: 11111
-        securityContext:
-          privileged: true
-          capabilities:
-            add:
-              - SYS_ADMIN
       volumes:
         - name: loxilb-ssl
           secret:
