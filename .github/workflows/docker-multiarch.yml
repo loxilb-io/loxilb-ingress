@@ -3,15 +3,12 @@ name:  Docker-Multi-Arch
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
      inputs:
       tagName:
         description: 'Tag Name'     
         required: true
         default: 'latest'
-        
 jobs:
   build:
     runs-on: ubuntu-latest
