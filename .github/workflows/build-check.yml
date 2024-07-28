@@ -1,4 +1,4 @@
-name:  Docker-Multi-Arch
+name:  Build-Check-Multi-Arch
   
 on:
   pull_request:
