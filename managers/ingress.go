@@ -27,9 +27,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	loxiapi "github.com/loxilb-io/kube-loxilb/pkg/api"
+)
+
+const (
+	loxilbIngressClassName = "loxilb"
 )
 
 type LoxilbIngressReconciler struct {
@@ -173,7 +179,46 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 }
 
 func (r *LoxilbIngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	checkIngClassNameFunc := func(ing *netv1.Ingress) bool {
+		if ing.Spec.IngressClassName != nil {
+			if *ing.Spec.IngressClassName == loxilbIngressClassName {
+				return true
+			}
+		}
+		return false
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&netv1.Ingress{}).
+		WithEventFilter(predicate.Funcs{
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				ing, ok := e.ObjectNew.(*netv1.Ingress)
+				if ok {
+					return checkIngClassNameFunc(ing)
+				}
+				return false
+			},
+			DeleteFunc: func(e event.DeleteEvent) bool {
+				ing, ok := e.Object.(*netv1.Ingress)
+				if ok {
+					return checkIngClassNameFunc(ing)
+				}
+				return false
+			},
+			CreateFunc: func(e event.CreateEvent) bool {
+				ing, ok := e.Object.(*netv1.Ingress)
+				if ok {
+					return checkIngClassNameFunc(ing)
+				}
+				return false
+			},
+			GenericFunc: func(e event.GenericEvent) bool {
+				ing, ok := e.Object.(*netv1.Ingress)
+				if ok {
+					return checkIngClassNameFunc(ing)
+				}
+				return false
+			},
+		}).
 		Complete(r)
 }
