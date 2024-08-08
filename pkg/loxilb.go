@@ -31,6 +31,7 @@ func SpawnLoxiLB() {
 	for {
 		cmd := exec.Command(LoxiLBImg, "--proxyonlymode")
 		klog.Infof("Spawning loxilb: %s", cmd)
+		cmd.Stdout = os.Stdout
 		err := cmd.Run()
 		if err != nil {
 			klog.Infof("Spawning loxilb failed: %s", err)
