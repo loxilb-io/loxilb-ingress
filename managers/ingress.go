@@ -67,7 +67,7 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// when ingress is added, install rule to loxilb-ingress
 	models, err := r.createLoxiModelList(ctx, ingress)
 	if err != nil {
-		logger.Info("failed to create loxilb loadbalancer model", "error", err)
+		logger.Error(err, "Failed to set ingress. failed to create loxilb loadbalancer model", "[]loxiapi.LoadBalancerModel", models)
 		return ctrl.Result{}, err
 	}
 
@@ -209,7 +209,7 @@ func (r *LoxilbIngressReconciler) updateIngressStatus(ctx context.Context, ingre
 		if lbName, isok := ingress.Annotations["loadbalancer-service"]; isok {
 			lbSvcKey.Name = lbName
 		} else {
-			return fmt.Errorf("ingress %s/%s has no information about loadbalancer service", ingress.Namespace, ingress.Name)
+			return nil
 		}
 	}
 
