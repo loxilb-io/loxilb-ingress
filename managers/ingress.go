@@ -67,17 +67,27 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// when ingress is added, install rule to loxilb-ingress
 	models, err := r.createLoxiModelList(ctx, ingress)
 	if err != nil {
-		logger.Error(err, "Failed to set ingress. failed to create loxilb loadbalancer model", "ingress", ingress)
+		logger.Error(err, "Failed to set ingress. failed to create loxilb loadbalancer model", "[]loxiapi.LoadBalancerModel", models)
 	}
+
+	logger.V(4).Info("createLoxiModelList return models:", "[]loxiapi.LoadBalancerModel", models)
 
 	for _, model := range models {
 		err = r.LoxiClient.LoadBalancer().Create(ctx, &model)
 		if err != nil {
-			logger.Error(err, "Failed to set ingress. failed to install loadbalancer rule to loxilb", "ingress", ingress)
-			return ctrl.Result{}, err
+			if err.Error() != "lbrule-exists error" {
+				logger.Error(err, "Failed to set ingress. failed to install loadbalancer rule to loxilb", "loxiapi.LoadBalancerModel", model)
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
+	if err := r.updateIngressStatus(ctx, ingress); err != nil {
+		logger.Error(err, "Failed to update ingress status.", "ingress", ingress)
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("This resource is created", "ingress", ingress)
 	return ctrl.Result{}, nil
 }
 
@@ -122,6 +132,10 @@ func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpoints(ctx context.Co
 			}
 			loxilbEpList = append(loxilbEpList, loxilbEp)
 		}
+	}
+
+	if len(loxilbEpList) == 0 {
+		return loxilbEpList, fmt.Errorf("backend %s/%s service has no endpoint now", ns, name)
 	}
 
 	return loxilbEpList, nil
@@ -178,6 +192,52 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 	return models, nil
 }
 
+func (r *LoxilbIngressReconciler) updateIngressStatus(ctx context.Context, ingress *netv1.Ingress) error {
+	lbSvcKey := types.NamespacedName{}
+	if gwProvider, isok := ingress.Annotations["gateway-api-controller"]; isok {
+		if gwProvider == "loxilb.io/loxilb" {
+			lbSvcKey.Namespace = ingress.Annotations["parent-gateway-namespace"]
+			lbSvcKey.Name = fmt.Sprintf("%s-ingress-service", ingress.Annotations["parent-gateway"])
+		}
+	} else {
+		if lbNs, isok := ingress.Annotations["loadbalancer-service-namespace"]; isok {
+			lbSvcKey.Namespace = lbNs
+		} else {
+			lbSvcKey.Namespace = "default"
+		}
+
+		if lbName, isok := ingress.Annotations["loadbalancer-service"]; isok {
+			lbSvcKey.Name = lbName
+		} else {
+			return fmt.Errorf("ingress %s/%s has no information about loadbalancer service", ingress.Namespace, ingress.Name)
+		}
+	}
+
+	svc := &corev1.Service{}
+	if err := r.Client.Get(ctx, lbSvcKey, svc); err != nil {
+		return err
+	}
+
+	for _, ing := range svc.Status.LoadBalancer.Ingress {
+		newIngressLoadBalancerIngress := netv1.IngressLoadBalancerIngress{
+			IP:       ing.IP,
+			Hostname: ing.Hostname,
+		}
+		for _, port := range ing.Ports {
+			newIngressPortStatus := netv1.IngressPortStatus{
+				Port:     port.Port,
+				Protocol: port.Protocol,
+				Error:    port.Error,
+			}
+			newIngressLoadBalancerIngress.Ports = append(newIngressLoadBalancerIngress.Ports, newIngressPortStatus)
+		}
+
+		ingress.Status.LoadBalancer.Ingress = append(ingress.Status.LoadBalancer.Ingress, newIngressLoadBalancerIngress)
+	}
+
+	return r.Client.Status().Update(ctx, ingress)
+}
+
 func (r *LoxilbIngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	checkIngClassNameFunc := func(ing *netv1.Ingress) bool {
 		if ing.Spec.IngressClassName != nil {
@@ -192,10 +252,6 @@ func (r *LoxilbIngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&netv1.Ingress{}).
 		WithEventFilter(predicate.Funcs{
 			UpdateFunc: func(e event.UpdateEvent) bool {
-				ing, ok := e.ObjectNew.(*netv1.Ingress)
-				if ok {
-					return checkIngClassNameFunc(ing)
-				}
 				return false
 			},
 			DeleteFunc: func(e event.DeleteEvent) bool {
