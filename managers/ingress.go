@@ -67,24 +67,24 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// when ingress is added, install rule to loxilb-ingress
 	models, err := r.createLoxiModelList(ctx, ingress)
 	if err != nil {
-		logger.Error(err, "Failed to set ingress. failed to create loxilb loadbalancer model", "[]loxiapi.LoadBalancerModel", models)
+		logger.Info("failed to create loxilb loadbalancer model", "error", err)
+		return ctrl.Result{}, err
 	}
 
-	logger.V(4).Info("createLoxiModelList return models:", "[]loxiapi.LoadBalancerModel", models)
+	logger.Info("createLoxiModelList return models:", "[]loxiapi.LoadBalancerModel", models)
 
 	for _, model := range models {
 		err = r.LoxiClient.LoadBalancer().Create(ctx, &model)
 		if err != nil {
 			if err.Error() != "lbrule-exists error" {
-				logger.Error(err, "Failed to set ingress. failed to install loadbalancer rule to loxilb", "loxiapi.LoadBalancerModel", model)
+				logger.Error(err, "failed to install loadbalancer rule to loxilb", "loxiapi.LoadBalancerModel", model)
 				return ctrl.Result{}, err
 			}
 		}
 	}
 
 	if err := r.updateIngressStatus(ctx, ingress); err != nil {
-		logger.Error(err, "Failed to update ingress status.", "ingress", ingress)
-		return ctrl.Result{}, err
+		logger.Info("failed to update ingress status.", "error", err)
 	}
 
 	logger.Info("This resource is created", "ingress", ingress)
@@ -134,8 +134,8 @@ func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpoints(ctx context.Co
 		}
 	}
 
-	if len(loxilbEpList) == 0 {
-		return loxilbEpList, fmt.Errorf("backend %s/%s service has no endpoint now", ns, name)
+	if len(loxilbEpList) <= 0 {
+		return loxilbEpList, fmt.Errorf("no endpoints have been added to the %s/%s service yet. please wait", ns, name)
 	}
 
 	return loxilbEpList, nil
@@ -219,6 +219,10 @@ func (r *LoxilbIngressReconciler) updateIngressStatus(ctx context.Context, ingre
 	}
 
 	for _, ing := range svc.Status.LoadBalancer.Ingress {
+		if r.checkIngressLoadBalancerIngressExist(ingress, ing) {
+			continue
+		}
+
 		newIngressLoadBalancerIngress := netv1.IngressLoadBalancerIngress{
 			IP:       ing.IP,
 			Hostname: ing.Hostname,
@@ -236,6 +240,23 @@ func (r *LoxilbIngressReconciler) updateIngressStatus(ctx context.Context, ingre
 	}
 
 	return r.Client.Status().Update(ctx, ingress)
+}
+
+func (r *LoxilbIngressReconciler) checkIngressLoadBalancerIngressExist(ingress *netv1.Ingress, serviceIngress corev1.LoadBalancerIngress) bool {
+	for _, i := range ingress.Status.LoadBalancer.Ingress {
+		if i.IP != "" {
+			if i.IP == serviceIngress.IP {
+				return true
+			}
+		}
+		if i.Hostname != "" {
+			if i.Hostname == serviceIngress.Hostname {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func (r *LoxilbIngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
