@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -92,6 +93,7 @@ func main() {
 	}
 
 	go pkg.SpawnLoxiLB()
+	time.Sleep(10 * time.Second)
 
 	if loxilbIngressIP == "127.0.0.1" {
 		myIP, _ := pkg.GetLocalNonLoopBackIP()

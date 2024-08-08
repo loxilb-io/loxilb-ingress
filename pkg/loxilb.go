@@ -17,8 +17,8 @@
 package pkg
 
 import (
-	"fmt"
 	"k8s.io/klog/v2"
+	"os"
 	"os/exec"
 	"time"
 )
@@ -29,13 +29,12 @@ const (
 
 func SpawnLoxiLB() {
 	for {
-
-		command := fmt.Sprintf("%s --proxyonlymode", LoxiLBImg)
-		cmd := exec.Command("bash", "-c", command)
+		cmd := exec.Command(LoxiLBImg, "--proxyonlymode")
 		klog.Infof("Spawning loxilb: %s", cmd)
 		err := cmd.Run()
 		if err != nil {
 			klog.Infof("Spawning loxilb failed: %s", err)
+			os.Exit(2)
 		}
 		time.Sleep(3000 * time.Millisecond)
 	}
