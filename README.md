@@ -1,3 +1,5 @@
+[![Docker-Multi-Arch](https://github.com/loxilb-io/loxilb-ingress/actions/workflows/docker-multiarch.yml/badge.svg)](https://github.com/loxilb-io/loxilb-ingress/actions/workflows/docker-multiarch.yml) [![K3s-Loxi-Ingress-Sanity-CI](https://github.com/loxilb-io/loxilb/actions/workflows/k3s-loxi-ingress.yml/badge.svg)](https://github.com/loxilb-io/loxilb/actions/workflows/k3s-loxi-ingress.yml)   
+
 ## How to run loxilb-ingress
 
 In Kubernetes, there is usually a lot of overlap between network load-balancer and an Ingress functionality. This creates a lot of confusion. Overall, the differences between an Ingress and a load-balancer service can be categorized as follows:
