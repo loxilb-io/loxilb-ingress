@@ -7,7 +7,7 @@ COPY . .
 
 RUN make build
 
-FROM ghcr.io/loxilb-io/loxilb:v0.9.6
+FROM ghcr.io/loxilb-io/loxilb:latest
 
 LABEL name="loxilb-ingress-manager" \
       vendor="loxilb.io" \
