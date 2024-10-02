@@ -260,6 +260,13 @@ spec:
         command: [ "/bin/loxilb-ingress" ]
         ports:
         - containerPort: 11111
+        livenessProbe:
+          httpGet:
+            path: netlox/v1/config/loadbalancer/all
+            port: 11111
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 5
       volumes:
         - name: loxilb-ssl
           secret:
