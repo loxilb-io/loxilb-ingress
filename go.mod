@@ -3,7 +3,7 @@ module loxilb.io/loxilb-ingress-manager
 go 1.23.0
 
 require (
-	github.com/loxilb-io/kube-loxilb v0.9.6-0.20240724081844-310d8829b72f
+	github.com/loxilb-io/kube-loxilb v0.9.7-0.20241004024038-4b8ffe3b0ef9
 	k8s.io/api v0.30.3
 	k8s.io/apimachinery v0.30.3
 	k8s.io/client-go v0.30.3
