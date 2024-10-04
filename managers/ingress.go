@@ -19,6 +19,7 @@ package managers
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
@@ -47,15 +48,40 @@ type LoxilbIngressReconciler struct {
 func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	ruleName := fmt.Sprintf("%s_%s", req.Namespace, req.Name)
+	ruleNameHTTPS := fmt.Sprintf("%s_%s_https", req.Namespace, req.Name)
+
+	currLBList, err := r.LoxiClient.LoadBalancer().List(ctx)
+	if err != nil {
+		logger.Info("Failed to get existing loxilb-ingress rules")
+		return ctrl.Result{}, err
+	}
+
+	exist := false
+	existHTTPS := false
+	for _, lbItem := range currLBList.Item {
+		if lbItem.Service.Name == ruleName {
+			exist = true
+		} else if lbItem.Service.Name == ruleNameHTTPS {
+			existHTTPS = true
+		}
+	}
+
 	ingress := &netv1.Ingress{}
-	err := r.Client.Get(ctx, req.NamespacedName, ingress)
+	err = r.Client.Get(ctx, req.NamespacedName, ingress)
 	if err != nil {
 		// Ingress is deleted.
 		if errors.IsNotFound(err) {
 			logger.Info("This resource is deleted", "Ingress", req.NamespacedName)
-			ruleName := fmt.Sprintf("%s_%s", req.Namespace, req.Name)
-			if err := r.LoxiClient.LoadBalancer().DeleteByName(ctx, ruleName); err != nil {
-				logger.Error(err, "failed to delete loxilb-ingress rule "+ruleName)
+			if exist {
+				if err := r.LoxiClient.LoadBalancer().DeleteByName(ctx, ruleName); err != nil {
+					logger.Error(err, "failed to delete loxilb-ingress rule "+ruleName)
+				}
+			}
+			if existHTTPS {
+				if err := r.LoxiClient.LoadBalancer().DeleteByName(ctx, ruleNameHTTPS); err != nil {
+					logger.Error(err, "failed to delete loxilb-ingress rule "+ruleNameHTTPS)
+				}
 			}
 			return ctrl.Result{}, nil
 		}
@@ -67,13 +93,54 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// when ingress is added, install rule to loxilb-ingress
 	models, err := r.createLoxiModelList(ctx, ingress)
 	if err != nil {
+		if exist {
+			if err := r.LoxiClient.LoadBalancer().DeleteByName(ctx, ruleName); err == nil {
+				logger.Info("deleted loxilb-ingress rule ", ruleName, "no endpoints")
+			}
+		}
+		if existHTTPS {
+			if err := r.LoxiClient.LoadBalancer().DeleteByName(ctx, ruleNameHTTPS); err == nil {
+				logger.Info("deleted loxilb-ingress rule ", ruleNameHTTPS, "no endpoints")
+			}
+		}
 		logger.Error(err, "Failed to set ingress. failed to create loxilb loadbalancer model", "[]loxiapi.LoadBalancerModel", models)
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("createLoxiModelList return models:", "[]loxiapi.LoadBalancerModel", models)
-
+	var applyModels []loxiapi.LoadBalancerModel
+nextModel:
 	for _, model := range models {
+		for _, lbItem := range currLBList.Item {
+			if lbItem.Service.Name == model.Service.Name && len(lbItem.Endpoints) == len(model.Endpoints) {
+				match := true
+				for _, mep := range model.Endpoints {
+					epMatch := false
+					for _, ep := range lbItem.Endpoints {
+						if mep.EndpointIP == ep.EndpointIP && mep.TargetPort == ep.TargetPort {
+							epMatch = true
+							break
+						}
+					}
+					if !epMatch {
+						match = false
+						break
+					}
+				}
+				if match {
+					continue nextModel
+				}
+			}
+		}
+		applyModels = append(applyModels, model)
+	}
+
+	if len(applyModels) <= 0 {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	logger.Info("createLoxiModelList return models:", "[]loxiapi.LoadBalancerModel", applyModels)
+
+	for _, model := range applyModels {
 		err = r.LoxiClient.LoadBalancer().Create(ctx, &model)
 		if err != nil {
 			if err.Error() != "lbrule-exists error" {
@@ -88,7 +155,7 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	logger.Info("This resource is created", "ingress", ingress)
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
 func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, externalIP string, security int32, host string) loxiapi.LoadBalancerService {
@@ -141,7 +208,7 @@ func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpoints(ctx context.Co
 	return loxilbEpList, nil
 }
 
-func (r *LoxilbIngressReconciler) checkTlsHost(host string, TLS []netv1.IngressTLS) bool {
+func (r *LoxilbIngressReconciler) checkTLSHost(host string, TLS []netv1.IngressTLS) bool {
 	for _, tls := range TLS {
 		for _, tlsHost := range tls.Hosts {
 			if host == tlsHost {
@@ -170,11 +237,15 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 				ns := r.getBackendServiceNamespace(ingress, name)
 				port := path.Backend.Service.Port.Number
 				security := int32(0)
-				if r.checkTlsHost(rule.Host, ingress.Spec.TLS) {
+				if r.checkTLSHost(rule.Host, ingress.Spec.TLS) {
 					security = 1
 				}
 
-				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, ingress.Name, r.LoxiClient.Host, security, rule.Host)
+				lbName := ingress.Name
+				if security == 1 {
+					lbName += "_https"
+				}
+				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, security, rule.Host)
 				loxiep, err := r.createLoxiLoadBalancerEndpoints(ctx, ns, name, port)
 				if err != nil {
 					return models, err
