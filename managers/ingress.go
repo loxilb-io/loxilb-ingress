@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	loxiapi "github.com/loxilb-io/kube-loxilb/pkg/api"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -34,7 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	loxiapi "github.com/loxilb-io/kube-loxilb/pkg/api"
+	"loxilb.io/loxilb-ingress-manager/pkg"
 )
 
 const (
@@ -94,7 +95,7 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// when ingress is added, install rule to loxilb-ingress
 	var models []loxiapi.LoadBalancerModel
-	if _, isok := ingress.Annotations["loxilb.io/direct-loadbalance"]; isok {
+	if _, isok := ingress.Annotations["loxilb.io/direct-loadbalance-service"]; isok {
 		models, err = r.createDirectLoxiModelList(ctx, ingress)
 	} else {
 		models, err = r.createLoxiModelList(ctx, ingress)
@@ -166,7 +167,7 @@ nextModel:
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
-func (r *LoxilbIngressReconciler) createDirectLoxiLoadBalancerService(ns, name, externalIP, protocol string, host string, port int32) loxiapi.LoadBalancerService {
+func (r *LoxilbIngressReconciler) createDirectLoxiLoadBalancerService(ns, name, externalIP, protocol, host, epSelect string, port int32) loxiapi.LoadBalancerService {
 	service := loxiapi.LoadBalancerService{
 		ExternalIP: externalIP,
 		Protocol:   strings.ToLower(protocol),
@@ -174,6 +175,23 @@ func (r *LoxilbIngressReconciler) createDirectLoxiLoadBalancerService(ns, name, 
 		Name:       fmt.Sprintf("%s_%s", ns, name),
 		Host:       host,
 		Port:       uint16(port),
+	}
+
+	switch epSelect {
+	case pkg.EndPointSel_RR:
+		service.Sel = loxiapi.LbSelRr
+	case pkg.EndPointSel_HASH:
+		service.Sel = loxiapi.LbSelHash
+	case pkg.EndpointSel_PRIORITY:
+		service.Sel = loxiapi.LbSelPrio
+	case pkg.EndPointSel_PERSIST:
+		service.Sel = loxiapi.LbSelRrPersist
+	case pkg.EndPointSel_LC:
+		service.Sel = loxiapi.LbSelLeastConnections
+	case pkg.EndPointSel_N2:
+		service.Sel = loxiapi.LbSelN2
+	default:
+		service.Sel = loxiapi.LbSelRr
 	}
 
 	return service
@@ -292,6 +310,11 @@ func (r *LoxilbIngressReconciler) createDirectLoxiModelList(ctx context.Context,
 		svcNs = ingress.Namespace
 	}
 
+	selStr, isSel := ingress.Annotations["loxilb.io/epselect"]
+	if !isSel {
+		selStr = pkg.EndPointSel_RR
+	}
+
 	svc := &corev1.Service{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: svcNs, Name: svcName}, svc); err != nil {
 		return nil, err
@@ -305,7 +328,7 @@ func (r *LoxilbIngressReconciler) createDirectLoxiModelList(ctx context.Context,
 		if err != nil {
 			return models, err
 		}
-		loxisvc := r.createDirectLoxiLoadBalancerService(svcNs, lbName, "0.0.0.0", protocol, "", port.Port)
+		loxisvc := r.createDirectLoxiLoadBalancerService(svcNs, lbName, "0.0.0.0", protocol, "", selStr, port.Port)
 		loxiep, err := r.createLoxiLoadBalancerEndpointsWithTargetPort(ctx, svcNs, svcName, targetPortNum)
 		if err != nil {
 			return models, err
