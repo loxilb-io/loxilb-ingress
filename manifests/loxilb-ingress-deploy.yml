@@ -115,8 +115,6 @@ spec:
     spec:
       #hostNetwork: true
       #dnsPolicy: ClusterFirstWithHostNet
-      securityContext:
-        privileged: true
       serviceAccountName: loxilb-ingress
       containers:
       - name: loxilb-ingress
@@ -128,6 +126,8 @@ spec:
         command: [ "/bin/loxilb-ingress" ]
         ports:
         - containerPort: 11111
+        securityContext:
+          privileged: true
         livenessProbe:
           httpGet:
             path: netlox/v1/config/loadbalancer/all
