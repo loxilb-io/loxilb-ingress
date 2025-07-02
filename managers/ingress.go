@@ -197,7 +197,7 @@ func (r *LoxilbIngressReconciler) createDirectLoxiLoadBalancerService(ns, name, 
 	return service
 }
 
-func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, externalIP string, security int32, host string) loxiapi.LoadBalancerService {
+func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, externalIP, epSelect string, security int32, host string) loxiapi.LoadBalancerService {
 	service := loxiapi.LoadBalancerService{
 		ExternalIP: externalIP,
 		Protocol:   "tcp",
@@ -205,6 +205,23 @@ func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, extern
 		Name:       fmt.Sprintf("%s_%s", ns, name),
 		Host:       host,
 		Security:   security,
+	}
+
+	switch epSelect {
+	case pkg.EndPointSel_RR:
+		service.Sel = loxiapi.LbSelRr
+	case pkg.EndPointSel_HASH:
+		service.Sel = loxiapi.LbSelHash
+	case pkg.EndpointSel_PRIORITY:
+		service.Sel = loxiapi.LbSelPrio
+	case pkg.EndPointSel_PERSIST:
+		service.Sel = loxiapi.LbSelRrPersist
+	case pkg.EndPointSel_LC:
+		service.Sel = loxiapi.LbSelLeastConnections
+	case pkg.EndPointSel_N2:
+		service.Sel = loxiapi.LbSelN2
+	default:
+		service.Sel = loxiapi.LbSelRr
 	}
 
 	// when ingress is set TLS, using https port (443)
@@ -347,6 +364,11 @@ func (r *LoxilbIngressReconciler) createDirectLoxiModelList(ctx context.Context,
 
 func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingress *netv1.Ingress) ([]loxiapi.LoadBalancerModel, error) {
 	models := make([]loxiapi.LoadBalancerModel, 0)
+	selStr, isSel := ingress.Annotations["loxilb.io/epselect"]
+	if !isSel {
+		selStr = pkg.EndPointSel_RR
+	}
+
 	for _, rule := range ingress.Spec.Rules {
 		if rule.HTTP == nil {
 			continue
@@ -366,7 +388,7 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 				if security == 1 {
 					lbName += "_https"
 				}
-				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, security, rule.Host)
+				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, selStr, security, rule.Host)
 				loxiep, err := r.createLoxiLoadBalancerEndpointsWithTargetPort(ctx, ns, name, port)
 				if err != nil {
 					return models, err
