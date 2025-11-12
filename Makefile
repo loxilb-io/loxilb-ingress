@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := build
 bin=loxilb-ingress
-TAG?=latest
+TAG?=persist2
 
 build:
 	@mkdir -p ./bin

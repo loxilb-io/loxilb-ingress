@@ -7,12 +7,12 @@ COPY . .
 
 RUN make build
 
-FROM ghcr.io/loxilb-io/loxilb:latest
+FROM ghcr.io/loxilb-io/loxilb:ingress-persist3
 
 LABEL name="loxilb-ingress-manager" \
       vendor="loxilb.io" \
       version=$GIT_VERSION \
-      release="0.1" \
+      release="persist-0.2" \
       summary="loxilb-ingress-manager docker image" \
       description="ingress implementation for loxilb" \
       maintainer="backguyn@netlox.io"
