@@ -1,3 +1,4 @@
+ARG LOXILB_IMG="ghcr.io/loxilb-io/loxilb:latest"
 FROM golang:1.23-alpine AS builder
 
 RUN apk update && apk add git && apk add make
@@ -7,8 +8,9 @@ COPY . .
 
 RUN make build
 
-FROM ghcr.io/loxilb-io/loxilb:latest
+FROM $LOXILB_IMG
 
+ARG GIT_VERSION="v0.1.0"
 LABEL name="loxilb-ingress-manager" \
       vendor="loxilb.io" \
       version=$GIT_VERSION \

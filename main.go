@@ -36,6 +36,7 @@ import (
 
 	"loxilb.io/loxilb-ingress-manager/managers"
 	"loxilb.io/loxilb-ingress-manager/pkg"
+	"loxilb.io/loxilb-ingress-manager/pkg/cert"
 
 	loxiapi "github.com/loxilb-io/kube-loxilb/pkg/api"
 	//+kubebuilder:scaffold:imports
@@ -105,16 +106,20 @@ func main() {
 	loxiLBLiveCh := make(chan *loxiapi.LoxiClient)
 	loxiLBDeadCh := make(chan struct{})
 	loxiLBUrl := fmt.Sprintf("http://%s:11111", loxilbIngressIP)
-	loxiClient, err := loxiapi.NewLoxiClient(loxiLBUrl, loxiLBLiveCh, loxiLBDeadCh, false, false)
+	loxiClient, err := loxiapi.NewLoxiClient(loxiLBUrl, loxiLBLiveCh, loxiLBDeadCh, false, false, "ingress-client", loxiapi.CIDefaultZone, 0)
 	if err != nil {
 		setupLog.Error(err, "failed to create LoxiLB Client")
 		os.Exit(1)
 	}
 
+	// Initialize certificate manager
+	certManager := cert.NewManager(mgr.GetClient(), loxiClient)
+
 	if err = (&managers.LoxilbIngressReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		LoxiClient: loxiClient,
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		LoxiClient:  loxiClient,
+		CertManager: certManager,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create manager", "manager", "LoxilbIngress")
 		os.Exit(1)

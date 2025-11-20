@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := build
 bin=loxilb-ingress
 TAG?=latest
+LOXILB_IMG?=ghcr.io/loxilb-io/loxilb:latest
 
 build:
 	@mkdir -p ./bin
@@ -11,4 +12,4 @@ clean:
 	go clean .
 
 docker: build
-	sudo docker build -t ghcr.io/loxilb-io/${bin}:${TAG} .
+	sudo docker build --build-arg LOXILB_IMG=${LOXILB_IMG} -t ghcr.io/loxilb-io/${bin}:${TAG} .

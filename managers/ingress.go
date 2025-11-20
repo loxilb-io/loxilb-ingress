@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	"loxilb.io/loxilb-ingress-manager/pkg"
+	"loxilb.io/loxilb-ingress-manager/pkg/cert"
 )
 
 const (
@@ -44,8 +45,9 @@ const (
 
 type LoxilbIngressReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	LoxiClient *loxiapi.LoxiClient
+	Scheme      *runtime.Scheme
+	LoxiClient  *loxiapi.LoxiClient
+	CertManager *cert.Manager
 }
 
 func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -62,11 +64,14 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	exist := false
 	existHTTPS := false
+	var HttpsHostName string
+
 	for _, lbItem := range currLBList.Item {
 		if lbItem.Service.Name == ruleName {
 			exist = true
 		} else if lbItem.Service.Name == ruleNameHTTPS {
 			existHTTPS = true
+			HttpsHostName = lbItem.Service.Host
 		}
 	}
 
@@ -76,6 +81,7 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// Ingress is deleted.
 		if errors.IsNotFound(err) {
 			logger.Info("This resource is deleted", "Ingress", req.NamespacedName)
+
 			if exist {
 				if err := r.LoxiClient.LoadBalancer().DeleteByName(ctx, ruleName); err != nil {
 					logger.Error(err, "failed to delete loxilb-ingress rule "+ruleName)
@@ -86,11 +92,26 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 					logger.Error(err, "failed to delete loxilb-ingress rule "+ruleNameHTTPS)
 				}
 			}
+
+			// Cleanup certificates when ingress is deleted
+			if r.CertManager != nil {
+				if err := r.CertManager.CleanupIngressCertificates(ctx, HttpsHostName); err != nil {
+					logger.Error(err, "failed to cleanup certificates")
+				}
+			}
 			return ctrl.Result{}, nil
 		}
 
 		logger.Error(err, "Failed to get ingress", "ingress", ingress)
 		return ctrl.Result{}, err
+	}
+
+	// Process TLS certificates before creating loxilb rules
+	if r.CertManager != nil && len(ingress.Spec.TLS) > 0 {
+		if err := r.CertManager.ProcessIngressTLS(ctx, ingress); err != nil {
+			logger.Error(err, "failed to process TLS certificates", "ingress", ingress.Name)
+			return ctrl.Result{}, err
+		}
 	}
 
 	// when ingress is added, install rule to loxilb-ingress
@@ -197,13 +218,13 @@ func (r *LoxilbIngressReconciler) createDirectLoxiLoadBalancerService(ns, name, 
 	return service
 }
 
-func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, externalIP, epSelect string, security int32, host string) loxiapi.LoadBalancerService {
+func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, externalIP, epSelect string, security int32, host, path string) loxiapi.LoadBalancerService {
 	service := loxiapi.LoadBalancerService{
 		ExternalIP: externalIP,
 		Protocol:   "tcp",
 		Mode:       4, // fullproxy mode
 		Name:       fmt.Sprintf("%s_%s", ns, name),
-		Host:       host,
+		Host:       host + path,
 		Security:   security,
 	}
 
@@ -388,7 +409,7 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 				if security == 1 {
 					lbName += "_https"
 				}
-				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, selStr, security, rule.Host)
+				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, selStr, security, rule.Host, path.Path)
 				loxiep, err := r.createLoxiLoadBalancerEndpointsWithTargetPort(ctx, ns, name, port)
 				if err != nil {
 					return models, err
