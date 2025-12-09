@@ -58,11 +58,16 @@ func main() {
 	var loxilbIngressIP string
 	var enableLeaderElection bool
 	var probeAddr string
+	var enablePrometheus bool
+	var proxyOnlyMode bool
 	flag.StringVar(&loxilbIngressIP, "pod-ip", "127.0.0.1", "The address LoxiLB ingress pod's self IP address.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	flag.BoolVar(&enablePrometheus, "prometheus", false, "Run prometheus thread")
+	flag.BoolVar(&enablePrometheus, "p", false, "Run prometheus thread")
+	flag.BoolVar(&proxyOnlyMode, "proxyonlymode", false, "Run loxilb in proxy only mode")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -93,7 +98,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	go pkg.SpawnLoxiLB()
+	go pkg.SpawnLoxiLB(enablePrometheus, proxyOnlyMode)
 	time.Sleep(10 * time.Second)
 
 	if loxilbIngressIP == "127.0.0.1" {

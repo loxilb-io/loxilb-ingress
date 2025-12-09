@@ -24,6 +24,7 @@ import (
 
 	loxiapi "github.com/loxilb-io/kube-loxilb/pkg/api"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	netv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
@@ -64,14 +65,14 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	exist := false
 	existHTTPS := false
-	var HttpsHostName string
+	var HttpsHostName []string
 
 	for _, lbItem := range currLBList.Item {
 		if lbItem.Service.Name == ruleName {
 			exist = true
 		} else if lbItem.Service.Name == ruleNameHTTPS {
 			existHTTPS = true
-			HttpsHostName = lbItem.Service.Host
+			HttpsHostName = append(HttpsHostName, lbItem.Service.Host)
 		}
 	}
 
@@ -218,14 +219,17 @@ func (r *LoxilbIngressReconciler) createDirectLoxiLoadBalancerService(ns, name, 
 	return service
 }
 
-func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, externalIP, epSelect string, security int32, host, path string) loxiapi.LoadBalancerService {
+func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, externalIP, epSelect string, security int32, host, path, pathType string) loxiapi.LoadBalancerService {
 	service := loxiapi.LoadBalancerService{
-		ExternalIP: externalIP,
-		Protocol:   "tcp",
-		Mode:       4, // fullproxy mode
-		Name:       fmt.Sprintf("%s_%s", ns, name),
-		Host:       host + path,
-		Security:   security,
+		ExternalIP:      externalIP,
+		Protocol:        "tcp",
+		Mode:            4, // fullproxy mode
+		Name:            fmt.Sprintf("%s_%s", ns, name),
+		Host:            host,
+		PathPrefix:      path,
+		PathMatchMode:   loxiapi.PathMatchModeType(strings.ToLower(pathType)),
+		BackendProtocol: "http1",
+		Security:        security,
 	}
 
 	switch epSelect {
@@ -257,25 +261,41 @@ func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, extern
 
 func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpoints(ctx context.Context, ns, name string) ([]loxiapi.LoadBalancerEndpoint, error) {
 	loxilbEpList := make([]loxiapi.LoadBalancerEndpoint, 0)
-	key := types.NamespacedName{
-		Namespace: ns,
-		Name:      name,
+
+	// List EndpointSlices for the service
+	epSliceList := &discoveryv1.EndpointSliceList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(ns),
+		client.MatchingLabels{
+			"kubernetes.io/service-name": name,
+		},
 	}
 
-	ep := &corev1.Endpoints{}
-	if err := r.Get(ctx, key, ep); err != nil {
+	if err := r.List(ctx, epSliceList, listOpts...); err != nil {
 		return loxilbEpList, err
 	}
 
-	for _, subset := range ep.Subsets {
-		for _, addr := range subset.Addresses {
-			for _, port := range subset.Ports {
-				loxilbEp := loxiapi.LoadBalancerEndpoint{
-					EndpointIP: addr.IP,
-					TargetPort: uint16(port.Port),
-					Weight:     uint8(1),
+	// Iterate through all EndpointSlices
+	for _, epSlice := range epSliceList.Items {
+		for _, endpoint := range epSlice.Endpoints {
+			// Skip endpoints that are not ready
+			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+				continue
+			}
+
+			// Get endpoint addresses
+			for _, addr := range endpoint.Addresses {
+				// Get ports from EndpointSlice
+				for _, port := range epSlice.Ports {
+					if port.Port != nil {
+						loxilbEp := loxiapi.LoadBalancerEndpoint{
+							EndpointIP: addr,
+							TargetPort: uint16(*port.Port),
+							Weight:     uint8(1),
+						}
+						loxilbEpList = append(loxilbEpList, loxilbEp)
+					}
 				}
-				loxilbEpList = append(loxilbEpList, loxilbEp)
 			}
 		}
 	}
@@ -289,24 +309,37 @@ func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpoints(ctx context.Co
 
 func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpointsWithTargetPort(ctx context.Context, ns, name string, targetPort int32) ([]loxiapi.LoadBalancerEndpoint, error) {
 	loxilbEpList := make([]loxiapi.LoadBalancerEndpoint, 0)
-	key := types.NamespacedName{
-		Namespace: ns,
-		Name:      name,
+
+	// List EndpointSlices for the service
+	epSliceList := &discoveryv1.EndpointSliceList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(ns),
+		client.MatchingLabels{
+			"kubernetes.io/service-name": name,
+		},
 	}
 
-	ep := &corev1.Endpoints{}
-	if err := r.Get(ctx, key, ep); err != nil {
+	if err := r.List(ctx, epSliceList, listOpts...); err != nil {
 		return loxilbEpList, err
 	}
 
-	for _, subset := range ep.Subsets {
-		for _, addr := range subset.Addresses {
-			loxilbEp := loxiapi.LoadBalancerEndpoint{
-				EndpointIP: addr.IP,
-				TargetPort: uint16(targetPort),
-				Weight:     uint8(1),
+	// Iterate through all EndpointSlices
+	for _, epSlice := range epSliceList.Items {
+		for _, endpoint := range epSlice.Endpoints {
+			// Skip endpoints that are not ready
+			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+				continue
 			}
-			loxilbEpList = append(loxilbEpList, loxilbEp)
+
+			// Get endpoint addresses
+			for _, addr := range endpoint.Addresses {
+				loxilbEp := loxiapi.LoadBalancerEndpoint{
+					EndpointIP: addr,
+					TargetPort: uint16(targetPort),
+					Weight:     uint8(1),
+				}
+				loxilbEpList = append(loxilbEpList, loxilbEp)
+			}
 		}
 	}
 
@@ -409,7 +442,14 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 				if security == 1 {
 					lbName += "_https"
 				}
-				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, selStr, security, rule.Host, path.Path)
+
+				// Get pathType, default to "prefix" if not specified
+				pathType := "prefix"
+				if path.PathType != nil {
+					pathType = string(*path.PathType)
+				}
+
+				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, selStr, security, rule.Host, path.Path, pathType)
 				loxiep, err := r.createLoxiLoadBalancerEndpointsWithTargetPort(ctx, ns, name, port)
 				if err != nil {
 					return models, err

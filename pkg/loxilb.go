@@ -17,19 +17,30 @@
 package pkg
 
 import (
-	"k8s.io/klog/v2"
 	"os"
 	"os/exec"
 	"time"
+
+	"k8s.io/klog/v2"
 )
 
 const (
 	LoxiLBImg = "/root/loxilb-io/loxilb/loxilb"
 )
 
-func SpawnLoxiLB() {
+func SpawnLoxiLB(enablePrometheus bool, proxyOnlyMode bool) {
 	for {
-		cmd := exec.Command(LoxiLBImg, "--proxyonlymode")
+		args := []string{}
+
+		if proxyOnlyMode {
+			args = append(args, "--proxyonlymode")
+		}
+
+		if enablePrometheus {
+			args = append(args, "-p")
+		}
+
+		cmd := exec.Command(LoxiLBImg, args...)
 		klog.Infof("Spawning loxilb: %s", cmd)
 		cmd.Stdout = os.Stdout
 		err := cmd.Run()

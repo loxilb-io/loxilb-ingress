@@ -188,19 +188,21 @@ func (m *Manager) storeCertificateForHost(ctx context.Context, hostname string, 
 }
 
 // CleanupIngressCertificates removes certificate files for all hosts in the ingress
-func (m *Manager) CleanupIngressCertificates(ctx context.Context, httpsHostName string) error {
+func (m *Manager) CleanupIngressCertificates(ctx context.Context, httpsHostName []string) error {
 	logger := log.FromContext(ctx)
 
-	if httpsHostName != "" {
-		hostDir := filepath.Join(certBaseDir, httpsHostName)
-		if err := os.RemoveAll(hostDir); err != nil {
-			logger.Error(err, "failed to remove certificate directory", "host", httpsHostName, "path", hostDir)
-		} else {
-			logger.Info("removed certificate directory", "host", httpsHostName, "path", hostDir)
-		}
+	if len(httpsHostName) != 0 {
+		for _, httpsHostName := range httpsHostName {
+			hostDir := filepath.Join(certBaseDir, httpsHostName)
+			if err := os.RemoveAll(hostDir); err != nil {
+				logger.Error(err, "failed to remove certificate directory", "host", httpsHostName, "path", hostDir)
+			} else {
+				logger.Info("removed certificate directory", "host", httpsHostName, "path", hostDir)
+			}
 
-		if err := m.LoxiClient.SniCert().Delete(ctx, &loxiapi.SniCertModel{Hostname: httpsHostName}); err != nil {
-			logger.Error(err, "failed to call LoxiLB API delete SNI certificate", "host", httpsHostName)
+			if err := m.LoxiClient.SniCert().Delete(ctx, &loxiapi.SniCertModel{Hostname: httpsHostName}); err != nil {
+				logger.Error(err, "failed to call LoxiLB API delete SNI certificate", "host", httpsHostName)
+			}
 		}
 	}
 	return nil
