@@ -113,6 +113,7 @@ func (m *Manager) getSecret(ctx context.Context, namespace, name string) (*corev
 // extractCertificateFromSecret extracts certificate and key data from Kubernetes secret
 // Supports both kubernetes.io/tls and Opaque secret types
 func (m *Manager) extractCertificateFromSecret(secret *corev1.Secret) ([]byte, []byte, error) {
+	logger := log.Log.WithName("cert-manager")
 	var certData, keyData []byte
 	var certExists, keyExists bool
 
@@ -142,18 +143,22 @@ func (m *Manager) extractCertificateFromSecret(secret *corev1.Secret) ([]byte, [
 	}
 
 	if !certExists {
+		logger.Error(nil, "certificate not found in secret", "secret", secret.Name)
 		return nil, nil, fmt.Errorf("certificate not found in secret %s (tried keys: tls.crt, cert, certificate, tls.cert, server.crt)", secret.Name)
 	}
 
 	if !keyExists {
+		logger.Error(nil, "private key not found in secret", "secret", secret.Name)
 		return nil, nil, fmt.Errorf("private key not found in secret %s (tried keys: tls.key, key, private-key, privatekey, tls.private.key, server.key)", secret.Name)
 	}
 
 	if len(certData) == 0 {
+		logger.Error(nil, "certificate data is empty in secret", "secret", secret.Name)
 		return nil, nil, fmt.Errorf("certificate data is empty in secret %s", secret.Name)
 	}
 
 	if len(keyData) == 0 {
+		logger.Error(nil, "private key data is empty in secret", "secret", secret.Name)
 		return nil, nil, fmt.Errorf("private key data is empty in secret %s", secret.Name)
 	}
 
