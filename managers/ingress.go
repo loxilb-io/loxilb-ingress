@@ -33,8 +33,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"loxilb.io/loxilb-ingress-manager/pkg"
 	"loxilb.io/loxilb-ingress-manager/pkg/cert"
@@ -571,8 +573,43 @@ func (r *LoxilbIngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return false
 	}
 
+	// secretToIngressMapper maps Secret changes to related Ingress objects
+	secretToIngressMapper := func(ctx context.Context, obj client.Object) []reconcile.Request {
+		secret := obj.(*corev1.Secret)
+
+		// List all Ingresses in the same namespace
+		ingressList := &netv1.IngressList{}
+		if err := r.List(ctx, ingressList, client.InNamespace(secret.Namespace)); err != nil {
+			return []reconcile.Request{}
+		}
+
+		// Find Ingresses that reference this Secret
+		requests := []reconcile.Request{}
+		for _, ing := range ingressList.Items {
+			if !checkIngClassNameFunc(&ing) {
+				continue
+			}
+
+			// Check if this Ingress references the Secret in its TLS configuration
+			for _, tls := range ing.Spec.TLS {
+				if tls.SecretName == secret.Name {
+					requests = append(requests, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: ing.Namespace,
+							Name:      ing.Name,
+						},
+					})
+					break
+				}
+			}
+		}
+
+		return requests
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&netv1.Ingress{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(secretToIngressMapper)).
 		WithEventFilter(predicate.Funcs{
 			UpdateFunc: func(e event.UpdateEvent) bool {
 				return false

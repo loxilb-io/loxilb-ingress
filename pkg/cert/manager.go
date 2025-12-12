@@ -97,15 +97,19 @@ func (m *Manager) ProcessIngressTLS(ctx context.Context, ingress *netv1.Ingress)
 
 // getSecret retrieves a secret from Kubernetes
 func (m *Manager) getSecret(ctx context.Context, namespace, name string) (*corev1.Secret, error) {
+	logger := log.Log.WithName("cert-manager")
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{
 		Namespace: namespace,
 		Name:      name,
 	}
 
+	logger.Info("attempting to get secret", "namespace", namespace, "name", name)
 	if err := m.Get(ctx, key, secret); err != nil {
+		logger.Error(err, "failed to get secret from Kubernetes API", "namespace", namespace, "name", name)
 		return nil, err
 	}
+	logger.Info("successfully retrieved secret", "namespace", namespace, "name", name)
 
 	return secret, nil
 }
