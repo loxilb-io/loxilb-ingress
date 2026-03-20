@@ -32,9 +32,10 @@ import (
 )
 
 const (
-	certBaseDir = "/opt/loxilb/cert"
-	certFile    = "server.crt"
-	keyFile     = "server.key"
+	certBaseDir       = "/opt/loxilb/cert"
+	certFile          = "server.crt"
+	keyFile           = "server.key"
+	mtlsClientBaseDir = "/opt/loxilb/cert/client"
 )
 
 type Manager struct {
@@ -214,5 +215,84 @@ func (m *Manager) CleanupIngressCertificates(ctx context.Context, httpsHostName 
 			}
 		}
 	}
+	return nil
+}
+
+// getMtlsCertBasePath returns the base path for mTLS certificates
+func (m *Manager) getMtlsCertBasePath(namespace, ingressName string) string {
+	return filepath.Join(mtlsClientBaseDir, namespace, ingressName)
+}
+
+// StoreMtlsFrontendCert stores frontend mTLS CA certificate and returns the file path
+func (m *Manager) StoreMtlsFrontendCert(ctx context.Context, namespace, ingressName string, certData []byte) (string, error) {
+	logger := log.FromContext(ctx)
+
+	// Create directory: /opt/loxilb/cert/client/{namespace}/{ingress-name}/frontend
+	frontendDir := filepath.Join(m.getMtlsCertBasePath(namespace, ingressName), "frontend")
+	if err := os.MkdirAll(frontendDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create frontend directory %s: %w", frontendDir, err)
+	}
+
+	// Write client-ca.crt file
+	certPath := filepath.Join(frontendDir, "client-ca.crt")
+	if err := os.WriteFile(certPath, certData, 0644); err != nil {
+		return "", fmt.Errorf("failed to write frontend CA certificate file %s: %w", certPath, err)
+	}
+	logger.Info("created frontend CA certificate file", "path", certPath)
+
+	return certPath, nil
+}
+
+// StoreMtlsBackendCerts stores backend mTLS certificates and returns the file paths
+func (m *Manager) StoreMtlsBackendCerts(ctx context.Context, namespace, ingressName string, caCertData, clientCertData, clientKeyData []byte) (caPath, certPath, keyPath string, err error) {
+	logger := log.FromContext(ctx)
+
+	// Create directory: /opt/loxilb/cert/client/{namespace}/{ingress-name}/backend
+	backendDir := filepath.Join(m.getMtlsCertBasePath(namespace, ingressName), "backend")
+	if err := os.MkdirAll(backendDir, 0755); err != nil {
+		return "", "", "", fmt.Errorf("failed to create backend directory %s: %w", backendDir, err)
+	}
+
+	// Write backend-ca.crt file (if provided)
+	if len(caCertData) > 0 {
+		caPath = filepath.Join(backendDir, "backend-ca.crt")
+		if err := os.WriteFile(caPath, caCertData, 0644); err != nil {
+			return "", "", "", fmt.Errorf("failed to write backend CA certificate file %s: %w", caPath, err)
+		}
+		logger.Info("created backend CA certificate file", "path", caPath)
+	}
+
+	// Write client.crt file
+	if len(clientCertData) > 0 {
+		certPath = filepath.Join(backendDir, "client.crt")
+		if err := os.WriteFile(certPath, clientCertData, 0644); err != nil {
+			return "", "", "", fmt.Errorf("failed to write backend client certificate file %s: %w", certPath, err)
+		}
+		logger.Info("created backend client certificate file", "path", certPath)
+	}
+
+	// Write client.key file
+	if len(clientKeyData) > 0 {
+		keyPath = filepath.Join(backendDir, "client.key")
+		if err := os.WriteFile(keyPath, clientKeyData, 0600); err != nil {
+			return "", "", "", fmt.Errorf("failed to write backend client key file %s: %w", keyPath, err)
+		}
+		logger.Info("created backend client key file", "path", keyPath)
+	}
+
+	return caPath, certPath, keyPath, nil
+}
+
+// CleanupIngressMtlsCertificates removes mTLS certificate directory for the ingress
+func (m *Manager) CleanupIngressMtlsCertificates(ctx context.Context, namespace, ingressName string) error {
+	logger := log.FromContext(ctx)
+
+	mtlsDir := m.getMtlsCertBasePath(namespace, ingressName)
+	if err := os.RemoveAll(mtlsDir); err != nil {
+		logger.Error(err, "failed to remove mTLS certificate directory", "path", mtlsDir)
+		return err
+	}
+	logger.Info("removed mTLS certificate directory", "path", mtlsDir)
+
 	return nil
 }
