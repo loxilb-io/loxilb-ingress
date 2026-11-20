@@ -25,6 +25,8 @@ type fakeLoxilb struct {
 	mu    sync.Mutex
 	rules []loxiapi.LoadBalancerModel
 	srv   *httptest.Server
+	// failing makes every request fail, as a loxilb that isn't serving its API yet.
+	failing bool
 }
 
 func newFakeLoxilb(t *testing.T) *fakeLoxilb {
@@ -39,6 +41,10 @@ func (f *fakeLoxilb) serve(w http.ResponseWriter, req *http.Request) {
 	const base = "/netlox/v1/config/loadbalancer"
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failing {
+		http.Error(w, "loxilb is not ready", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 
 	switch {
@@ -168,6 +174,19 @@ func assertMark(t *testing.T, ing *netv1.Ingress, key, want string) {
 	}
 }
 
+// assertRetrying reconciles the web Ingress and checks that it is retried soon because some
+// backends couldn't be installed.
+func assertRetrying(t *testing.T, r *LoxilbIngressReconciler, ctx context.Context) {
+	t.Helper()
+	res, err := r.Reconcile(ctx, webReq)
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if res.RequeueAfter != backendRetryInterval {
+		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, backendRetryInterval)
+	}
+}
+
 func webBackend() []client.Object {
 	return []client.Object{
 		testService("web", corev1.ServicePort{Name: "http", Port: 80, TargetPort: intstr.FromInt32(8000)}),
@@ -236,9 +255,7 @@ func TestProgrammedReportNotWrittenWithoutEndpoints(t *testing.T) {
 	)
 	a := pods[0]
 
-	if _, err := a.r.Reconcile(ctx, webReq); err == nil {
-		t.Fatal("expected reconcile error without endpoints")
-	}
+	assertRetrying(t, a.r, ctx)
 	assertMark(t, getIngress(t, a.r.Client), a.markKey, "")
 }
 
@@ -262,9 +279,7 @@ func TestProgrammedReportClearedWhenRulesAreDropped(t *testing.T) {
 	if err := c.Delete(ctx, slice); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.r.Reconcile(ctx, webReq); err == nil {
-		t.Fatal("expected reconcile error without endpoints")
-	}
+	assertRetrying(t, a.r, ctx)
 	assertMark(t, getIngress(t, c), a.markKey, "")
 	if got := a.loxilb.paths(); len(got) != 0 {
 		t.Fatalf("loxilb rules = %v, want none", got)
@@ -398,9 +413,9 @@ func TestCreateDirectLoxiModelListUsesEndpointSlicePorts(t *testing.T) {
 		}, "10.1.0.1"),
 	)
 
-	models, err := r.createDirectLoxiModelList(context.Background(), ingress)
-	if err != nil {
-		t.Fatal(err)
+	models, skipped, err := r.createDirectLoxiModelList(context.Background(), ingress)
+	if err != nil || len(skipped) != 0 {
+		t.Fatalf("unexpected error: %v, skipped: %v", err, skipped)
 	}
 	if len(models) != 2 {
 		t.Fatalf("models = %d, want 2", len(models))

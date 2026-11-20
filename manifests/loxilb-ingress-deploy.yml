@@ -157,6 +157,15 @@ spec:
           initialDelaySeconds: 30
           periodSeconds: 20
           timeoutSeconds: 5
+        # Ready once loxilb answers and the Ingresses that existed at startup have been
+        # reconciled once, so connections aren't sent to a Pod that has no rules yet.
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          periodSeconds: 2
+          timeoutSeconds: 3
+          failureThreshold: 3
       volumes:
         - name: loxilb-default-ssl
           secret:
