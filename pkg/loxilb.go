@@ -17,10 +17,12 @@
 package pkg
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"time"
 
+	loxiapi "github.com/loxilb-io/kube-loxilb/pkg/api"
 	"k8s.io/klog/v2"
 )
 
@@ -49,5 +51,25 @@ func SpawnLoxiLB(enablePrometheus bool, proxyOnlyMode bool) {
 			os.Exit(2)
 		}
 		time.Sleep(3000 * time.Millisecond)
+	}
+}
+
+// WaitForLoxiLB polls loxilb's API every interval until it answers or ctx ends, and reports whether
+// it answered. Any HTTP response counts. loxilb starts its API only after its datapath is set up,
+// so once it answers, rules can be installed.
+func WaitForLoxiLB(ctx context.Context, client *loxiapi.LoxiClient, interval time.Duration) bool {
+	for {
+		reqCtx, cancel := context.WithTimeout(ctx, time.Second)
+		_, err := client.HealthCheck().Get(reqCtx, "")
+		cancel()
+		if err == nil {
+			return true
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(interval):
+		}
 	}
 }

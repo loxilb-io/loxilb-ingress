@@ -102,7 +102,6 @@ func main() {
 	programmedKey := setupProgrammedReport(mgr)
 
 	go pkg.SpawnLoxiLB(enablePrometheus, proxyOnlyMode)
-	time.Sleep(10 * time.Second)
 
 	if loxilbIngressIP == "127.0.0.1" {
 		myIP, _ := pkg.GetLocalNonLoopBackIP()
@@ -119,6 +118,8 @@ func main() {
 		setupLog.Error(err, "failed to create LoxiLB Client")
 		os.Exit(1)
 	}
+
+	waitForLoxiLB(loxiClient)
 
 	// Initialize certificate manager
 	certManager := cert.NewManager(mgr.GetClient(), loxiClient)
@@ -151,6 +152,25 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// loxilbStartTimeout bounds the startup wait for loxilb's API. If loxilb hasn't answered by then,
+// the controller starts anyway and its reconciles retry; the readiness check keeps the Pod out of
+// Service until loxilb answers.
+const loxilbStartTimeout = 60 * time.Second
+
+// waitForLoxiLB holds the controller back until the loxilb spawned in this container answers, so
+// it doesn't reconcile into a loxilb that isn't up yet. This replaces a fixed 10-second sleep.
+func waitForLoxiLB(client *loxiapi.LoxiClient) {
+	ctx, cancel := context.WithTimeout(context.Background(), loxilbStartTimeout)
+	defer cancel()
+
+	start := time.Now()
+	if pkg.WaitForLoxiLB(ctx, client, 250*time.Millisecond) {
+		setupLog.Info("loxilb is up", "after", time.Since(start).Round(time.Millisecond))
+		return
+	}
+	setupLog.Info("loxilb hasn't answered; starting the controller anyway", "waited", loxilbStartTimeout)
 }
 
 // setupProgrammedReport returns the annotation key this Pod reports installed Ingress generations
