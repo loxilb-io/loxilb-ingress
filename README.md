@@ -264,3 +264,20 @@ Commercial support is available at
 </body>
 </html>
 ```
+
+## Checking which Pods have installed an Ingress
+
+Each loxilb-ingress Pod installs every Ingress into its own loxilb. After a Pod has installed an Ingress, it writes the Ingress's `metadata.generation` to an annotation named after the Pod:
+
+```
+$ kubectl get ingress site -o jsonpath='{.metadata.generation}{"\n"}{.metadata.annotations}{"\n"}'
+2
+{"loxilb.io/programmed.loxilb-ingress-x7k2p":"2","loxilb.io/programmed.loxilb-ingress-m4q9z":"1"}
+```
+
+Here `loxilb-ingress-x7k2p` serves the current spec, and `loxilb-ingress-m4q9z` hasn't installed it yet.
+
+* The value is written only after the rules are installed. A Pod removes its annotation when it can't install the rules (for example, the backend has no endpoints yet) or when it removes them.
+* When a container restarts, it removes its annotations at startup and writes them again after it reinstalls the rules. Annotations of Pods that no longer exist are left in place.
+* Pods that report carry the label `loxilb.io/programmed-report: "v1"`. Reporting needs the `POD_NAME` env and `patch` on `ingresses`, both in [manifests/loxilb-ingress-deploy.yml](manifests/loxilb-ingress-deploy.yml).
+* The Pod name must be 52 characters or shorter, because the part of the key after `loxilb.io/` can be at most 63 characters. A Pod with a longer name logs an error and doesn't report.

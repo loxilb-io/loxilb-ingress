@@ -28,7 +28,6 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	netv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -63,6 +62,9 @@ type LoxilbIngressReconciler struct {
 	Scheme      *runtime.Scheme
 	LoxiClient  *loxiapi.LoxiClient
 	CertManager *cert.Manager
+	// ProgrammedKey is the annotation key under which this Pod reports the Ingress generation it
+	// has installed (see programmed.go). Empty disables the report.
+	ProgrammedKey string
 }
 
 func isLoxilbIngress(ing *netv1.Ingress) bool {
@@ -103,6 +105,7 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if !isLoxilbIngress(ingress) {
 		logger.Info("Ingress no longer uses loxilb class. cleaning up managed rules", "Ingress", req.NamespacedName)
+		r.clearProgrammedOrLog(ctx, ingress)
 		return r.handleIngressDeleted(ctx, req.Namespace, req.Name, existingRules)
 	}
 
@@ -126,11 +129,13 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if cleanupErr := r.deleteManagedRules(ctx, existingRules); cleanupErr != nil {
 			logger.Error(cleanupErr, "failed to cleanup existing loxilb-ingress rules after model generation error")
 		}
+		r.clearProgrammedOrLog(ctx, ingress)
 		logger.Error(err, "Failed to set ingress. failed to create loxilb loadbalancer model", "[]loxiapi.LoadBalancerModel", models)
 		return ctrl.Result{}, err
 	}
 
 	if err := r.syncRules(ctx, existingRules, models); err != nil {
+		r.clearProgrammedOrLog(ctx, ingress)
 		logger.Error(err, "failed to synchronize loxilb-ingress rules", "Ingress", req.NamespacedName)
 		return ctrl.Result{}, err
 	}
@@ -139,8 +144,21 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		logger.Info("failed to update ingress status.", "error", err)
 	}
 
+	// Report after the status update: the patch changes the resourceVersion that the status
+	// update relies on.
+	if err := r.markProgrammed(ctx, ingress); err != nil {
+		logger.Error(err, "failed to report programmed generation", "Ingress", req.NamespacedName, "key", r.ProgrammedKey)
+		return ctrl.Result{}, err
+	}
+
 	logger.Info("Ingress reconciled successfully", "ingress", req.NamespacedName)
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+func (r *LoxilbIngressReconciler) clearProgrammedOrLog(ctx context.Context, ingress *netv1.Ingress) {
+	if err := r.clearProgrammed(ctx, ingress); err != nil {
+		log.FromContext(ctx).Error(err, "failed to clear programmed report", "Ingress", client.ObjectKeyFromObject(ingress), "key", r.ProgrammedKey)
+	}
 }
 
 func buildManagedRuleNameSet(req types.NamespacedName, ingress *netv1.Ingress) map[string]struct{} {
@@ -630,95 +648,137 @@ func (r *LoxilbIngressReconciler) createLoxiLoadBalancerService(ns, name, extern
 	return service
 }
 
-func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpoints(ctx context.Context, ns, name string) ([]loxiapi.LoadBalancerEndpoint, error) {
-	loxilbEpList := make([]loxiapi.LoadBalancerEndpoint, 0)
+// createLoxiLoadBalancerEndpointsForBackend builds the endpoints for an Ingress service backend.
+// The Ingress refers to a Service port, but traffic has to reach the Pod-side port, so the
+// referenced ServicePort is looked up on the Service and its resolved port is read from each
+// EndpointSlice.
+func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpointsForBackend(ctx context.Context, ns string, backend *netv1.IngressServiceBackend) ([]loxiapi.LoadBalancerEndpoint, error) {
+	svc := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: backend.Name}, svc); err != nil {
+		return nil, fmt.Errorf("failed to get backend service %s/%s: %w", ns, backend.Name, err)
+	}
 
-	// List EndpointSlices for the service
+	svcPort, err := findServicePort(svc, backend.Port)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.createLoxiLoadBalancerEndpointsForServicePort(ctx, svc, svcPort)
+}
+
+// createLoxiLoadBalancerEndpointsForServicePort builds the endpoints for one port of a Service,
+// using the Pod-side port that each EndpointSlice publishes for that ServicePort.
+func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpointsForServicePort(ctx context.Context, svc *corev1.Service, svcPort corev1.ServicePort) ([]loxiapi.LoadBalancerEndpoint, error) {
+	singleUnnamedPort := len(svc.Spec.Ports) == 1 && svcPort.Name == ""
+
 	epSliceList := &discoveryv1.EndpointSliceList{}
 	listOpts := []client.ListOption{
-		client.InNamespace(ns),
-		client.MatchingLabels{
-			"kubernetes.io/service-name": name,
-		},
+		client.InNamespace(svc.Namespace),
+		client.MatchingLabels{discoveryv1.LabelServiceName: svc.Name},
 	}
-
 	if err := r.List(ctx, epSliceList, listOpts...); err != nil {
-		return loxilbEpList, err
+		return nil, err
 	}
 
-	// Iterate through all EndpointSlices
-	for _, epSlice := range epSliceList.Items {
+	loxilbEpList := make([]loxiapi.LoadBalancerEndpoint, 0)
+	for i := range epSliceList.Items {
+		epSlice := &epSliceList.Items[i]
+		// Resolve per slice: Pods behind a named targetPort can expose different port numbers,
+		// and the EndpointSlice controller puts them in separate slices.
+		targetPort, ok := endpointSliceTargetPort(epSlice, svcPort, singleUnnamedPort)
+		if !ok {
+			continue
+		}
+
 		for _, endpoint := range epSlice.Endpoints {
 			// Skip endpoints that are not ready
 			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
 				continue
 			}
 
-			// Get endpoint addresses
 			for _, addr := range endpoint.Addresses {
-				// Get ports from EndpointSlice
-				for _, port := range epSlice.Ports {
-					if port.Port != nil {
-						loxilbEp := loxiapi.LoadBalancerEndpoint{
-							EndpointIP: addr,
-							TargetPort: uint16(*port.Port),
-							Weight:     uint8(1),
-						}
-						loxilbEpList = append(loxilbEpList, loxilbEp)
-					}
-				}
+				loxilbEpList = append(loxilbEpList, loxiapi.LoadBalancerEndpoint{
+					EndpointIP: addr,
+					TargetPort: uint16(targetPort),
+					Weight:     uint8(1),
+				})
 			}
 		}
 	}
 
-	if len(loxilbEpList) <= 0 {
-		return loxilbEpList, fmt.Errorf("no endpoints have been added to the %s/%s service yet. please wait", ns, name)
+	if len(loxilbEpList) == 0 {
+		return loxilbEpList, fmt.Errorf("no endpoints have been added to the %s/%s service port %d/%s yet. please wait", svc.Namespace, svc.Name, svcPort.Port, servicePortProtocol(svcPort))
 	}
 
 	return loxilbEpList, nil
 }
 
-func (r *LoxilbIngressReconciler) createLoxiLoadBalancerEndpointsWithTargetPort(ctx context.Context, ns, name string, targetPort int32) ([]loxiapi.LoadBalancerEndpoint, error) {
-	loxilbEpList := make([]loxiapi.LoadBalancerEndpoint, 0)
-
-	// List EndpointSlices for the service
-	epSliceList := &discoveryv1.EndpointSliceList{}
-	listOpts := []client.ListOption{
-		client.InNamespace(ns),
-		client.MatchingLabels{
-			"kubernetes.io/service-name": name,
-		},
-	}
-
-	if err := r.List(ctx, epSliceList, listOpts...); err != nil {
-		return loxilbEpList, err
-	}
-
-	// Iterate through all EndpointSlices
-	for _, epSlice := range epSliceList.Items {
-		for _, endpoint := range epSlice.Endpoints {
-			// Skip endpoints that are not ready
-			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
-				continue
+// findServicePort returns the TCP ServicePort that an Ingress backend port refers to.
+// An Ingress backend selects a Service port by its name or by its port number, never by targetPort.
+func findServicePort(svc *corev1.Service, backendPort netv1.ServiceBackendPort) (corev1.ServicePort, error) {
+	for _, sp := range svc.Spec.Ports {
+		if sp.Protocol != "" && sp.Protocol != corev1.ProtocolTCP {
+			continue
+		}
+		if backendPort.Name != "" {
+			if sp.Name == backendPort.Name {
+				return sp, nil
 			}
-
-			// Get endpoint addresses
-			for _, addr := range endpoint.Addresses {
-				loxilbEp := loxiapi.LoadBalancerEndpoint{
-					EndpointIP: addr,
-					TargetPort: uint16(targetPort),
-					Weight:     uint8(1),
-				}
-				loxilbEpList = append(loxilbEpList, loxilbEp)
-			}
+		} else if sp.Port == backendPort.Number {
+			return sp, nil
 		}
 	}
+	return corev1.ServicePort{}, fmt.Errorf("service %s/%s has no TCP port %s", svc.Namespace, svc.Name, describeBackendPort(backendPort))
+}
 
-	if len(loxilbEpList) <= 0 {
-		return loxilbEpList, fmt.Errorf("no endpoints have been added to the %s/%s service yet. please wait", ns, name)
+// endpointSliceTargetPort returns the Pod-side port an EndpointSlice publishes for svcPort.
+// EndpointSlice ports carry the ServicePort's name and the already resolved targetPort, both for
+// controller-managed slices and for hand-written ones of selector-less Services.
+// For a Service with a single unnamed port, a slice with a single port of the same protocol is
+// accepted whatever its name.
+func endpointSliceTargetPort(epSlice *discoveryv1.EndpointSlice, svcPort corev1.ServicePort, singleUnnamedPort bool) (int32, bool) {
+	protocol := servicePortProtocol(svcPort)
+	candidates := make([]int32, 0, len(epSlice.Ports))
+	for _, p := range epSlice.Ports {
+		if p.Port == nil {
+			continue
+		}
+		// EndpointPort.Protocol defaults to TCP, like ServicePort.Protocol.
+		epProtocol := corev1.ProtocolTCP
+		if p.Protocol != nil {
+			epProtocol = *p.Protocol
+		}
+		if epProtocol != protocol {
+			continue
+		}
+		name := ""
+		if p.Name != nil {
+			name = *p.Name
+		}
+		if name == svcPort.Name {
+			return *p.Port, true
+		}
+		candidates = append(candidates, *p.Port)
 	}
 
-	return loxilbEpList, nil
+	if singleUnnamedPort && len(candidates) == 1 {
+		return candidates[0], true
+	}
+	return 0, false
+}
+
+func servicePortProtocol(sp corev1.ServicePort) corev1.Protocol {
+	if sp.Protocol == "" {
+		return corev1.ProtocolTCP
+	}
+	return sp.Protocol
+}
+
+func describeBackendPort(p netv1.ServiceBackendPort) string {
+	if p.Name != "" {
+		return fmt.Sprintf("%q", p.Name)
+	}
+	return fmt.Sprintf("%d", p.Number)
 }
 
 func (r *LoxilbIngressReconciler) checkTLSHost(host string, TLS []netv1.IngressTLS) bool {
@@ -909,12 +969,8 @@ func (r *LoxilbIngressReconciler) createDirectLoxiModelList(ctx context.Context,
 	lbName := ingress.Name
 	for _, port := range svc.Spec.Ports {
 		protocol := string(port.Protocol)
-		targetPortNum, err := r.GetServicePortIntValue(svc, port)
-		if err != nil {
-			return models, err
-		}
 		loxisvc := r.createDirectLoxiLoadBalancerService(ingress.Namespace, lbName, "0.0.0.0", protocol, "", selStr, port.Port)
-		loxiep, err := r.createLoxiLoadBalancerEndpointsWithTargetPort(ctx, svcNs, svcName, targetPortNum)
+		loxiep, err := r.createLoxiLoadBalancerEndpointsForServicePort(ctx, svc, port)
 		if err != nil {
 			return models, err
 		}
@@ -957,7 +1013,6 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 			if path.Backend.Service != nil {
 				name := path.Backend.Service.Name
 				ns := r.getBackendServiceNamespace(ingress, name)
-				port := path.Backend.Service.Port.Number
 				security := int32(0)
 
 				// Determine security level based on TLS/mTLS configuration
@@ -981,7 +1036,7 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 				}
 
 				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, selStr, security, rule.Host, path.Path, pathType, mtlsFrontend, mtlsBackend)
-				loxiep, err := r.createLoxiLoadBalancerEndpointsWithTargetPort(ctx, ns, name, port)
+				loxiep, err := r.createLoxiLoadBalancerEndpointsForBackend(ctx, ns, path.Backend.Service)
 				if err != nil {
 					return models, err
 				}
@@ -1024,10 +1079,12 @@ func (r *LoxilbIngressReconciler) updateIngressStatus(ctx context.Context, ingre
 		return err
 	}
 
+	changed := false
 	for _, ing := range svc.Status.LoadBalancer.Ingress {
 		if r.checkIngressLoadBalancerIngressExist(ingress, ing) {
 			continue
 		}
+		changed = true
 
 		newIngressLoadBalancerIngress := netv1.IngressLoadBalancerIngress{
 			IP:       ing.IP,
@@ -1045,6 +1102,9 @@ func (r *LoxilbIngressReconciler) updateIngressStatus(ctx context.Context, ingre
 		ingress.Status.LoadBalancer.Ingress = append(ingress.Status.LoadBalancer.Ingress, newIngressLoadBalancerIngress)
 	}
 
+	if !changed {
+		return nil
+	}
 	return r.Status().Update(ctx, ingress)
 }
 
@@ -1063,33 +1123,6 @@ func (r *LoxilbIngressReconciler) checkIngressLoadBalancerIngressExist(ingress *
 	}
 
 	return false
-}
-
-func (r *LoxilbIngressReconciler) GetServicePortIntValue(svc *corev1.Service, port corev1.ServicePort) (int32, error) {
-	if port.TargetPort.IntValue() != 0 {
-		return int32(port.TargetPort.IntValue()), nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
-
-	selectorLabel := labels.Set(svc.Spec.Selector).AsSelector()
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.MatchingLabelsSelector{Selector: selectorLabel}); err != nil {
-		return 0, err
-	}
-
-	for _, pod := range podList.Items {
-		for _, c := range pod.Spec.Containers {
-			for _, p := range c.Ports {
-				if p.Name == port.TargetPort.String() {
-					return p.ContainerPort, nil
-				}
-			}
-		}
-	}
-
-	return 0, fmt.Errorf("not found port name %s in service %s", port.TargetPort.String(), svc.Name)
 }
 
 func (r *LoxilbIngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -1159,6 +1192,12 @@ func (r *LoxilbIngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(secretToIngressMapper)).
 		WithEventFilter(predicate.Funcs{
 			UpdateFunc: func(e event.UpdateEvent) bool {
+				if ingOld, ok := e.ObjectOld.(*netv1.Ingress); ok {
+					if ingNew, ok := e.ObjectNew.(*netv1.Ingress); ok && onlyOthersMarksChanged(ingOld, ingNew, r.ProgrammedKey) {
+						return false
+					}
+				}
+
 				if ingNew, ok := e.ObjectNew.(*netv1.Ingress); ok {
 					if checkIngClassNameFunc(ingNew) {
 						return true

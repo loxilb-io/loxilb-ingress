@@ -48,6 +48,7 @@ rules:
   - get
   - list
   - watch
+  - patch
 - apiGroups:
   - ""
   resources:
@@ -120,6 +121,8 @@ spec:
         app: loxilb-ingress
         app.kubernetes.io/instance: loxilb-ingress
         app.kubernetes.io/name: loxilb-ingress
+        # This build reports installed Ingresses as loxilb.io/programmed.<Pod name> annotations.
+        loxilb.io/programmed-report: "v1"
     spec:
       serviceAccountName: loxilb-ingress
       containers:
@@ -138,6 +141,11 @@ spec:
         image: "ghcr.io/loxilb-io/loxilb-ingress:latest"
         imagePullPolicy: Always
         command: [ "/bin/loxilb-ingress" ]
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         ports:
         - containerPort: 11111
         securityContext:
