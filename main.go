@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -98,6 +99,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	programmedKey := setupProgrammedReport(mgr)
+
 	go pkg.SpawnLoxiLB(enablePrometheus, proxyOnlyMode)
 	time.Sleep(10 * time.Second)
 
@@ -121,10 +124,11 @@ func main() {
 	certManager := cert.NewManager(mgr.GetClient(), loxiClient)
 
 	if err = (&managers.LoxilbIngressReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		LoxiClient:  loxiClient,
-		CertManager: certManager,
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		LoxiClient:    loxiClient,
+		CertManager:   certManager,
+		ProgrammedKey: programmedKey,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create manager", "manager", "LoxilbIngress")
 		os.Exit(1)
@@ -145,4 +149,31 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// setupProgrammedReport returns the annotation key this Pod reports installed Ingress generations
+// under, or "" when reporting is off. The Pod name comes from the POD_NAME env (downward API).
+// Marks left under the key by a previous run of this Pod are removed first, because loxilb starts
+// empty and the rules have to be installed again before they may be reported.
+func setupProgrammedReport(mgr ctrl.Manager) string {
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		setupLog.Info("POD_NAME is not set; not reporting programmed Ingresses")
+		return ""
+	}
+
+	key, err := managers.ProgrammedAnnotationKey(podName)
+	if err != nil {
+		setupLog.Error(err, "not reporting programmed Ingresses")
+		return ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := managers.ClearProgrammedAnnotations(ctx, mgr.GetAPIReader(), mgr.GetClient(), key); err != nil {
+		setupLog.Error(err, "failed to clear programmed reports of the previous run", "key", key)
+	}
+
+	setupLog.Info("reporting programmed Ingresses", "key", key)
+	return key
 }
