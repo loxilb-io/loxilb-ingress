@@ -123,13 +123,14 @@ func main() {
 	// Initialize certificate manager
 	certManager := cert.NewManager(mgr.GetClient(), loxiClient)
 
-	if err = (&managers.LoxilbIngressReconciler{
+	reconciler := &managers.LoxilbIngressReconciler{
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
 		LoxiClient:    loxiClient,
 		CertManager:   certManager,
 		ProgrammedKey: programmedKey,
-	}).SetupWithManager(mgr); err != nil {
+	}
+	if err = reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create manager", "manager", "LoxilbIngress")
 		os.Exit(1)
 	}
@@ -139,7 +140,8 @@ func main() {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	// Ready once loxilb answers and the Ingresses that exist now have been reconciled once.
+	if err := mgr.AddReadyzCheck("readyz", reconciler.ReadyzCheck); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}

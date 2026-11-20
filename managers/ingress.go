@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -44,6 +45,10 @@ import (
 
 const (
 	loxilbIngressClassName = "loxilb"
+
+	// backendRetryInterval is how soon an Ingress with backends that couldn't be installed
+	// (for example, no endpoints yet) is reconciled again.
+	backendRetryInterval = 5 * time.Second
 
 	// mTLS Frontend annotations
 	mtlsFrontendModeAnnotation      = "loxilb.io/mtls-frontend-mode"
@@ -65,6 +70,9 @@ type LoxilbIngressReconciler struct {
 	// ProgrammedKey is the annotation key under which this Pod reports the Ingress generation it
 	// has installed (see programmed.go). Empty disables the report.
 	ProgrammedKey string
+
+	// initialSync tracks the first reconcile pass that readiness waits for (see readiness.go).
+	initialSync initialSync
 }
 
 func isLoxilbIngress(ing *netv1.Ingress) bool {
@@ -85,6 +93,8 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		logger.Info("Failed to get existing loxilb-ingress rules")
 		return ctrl.Result{}, err
 	}
+	// loxilb answered, so this attempt counts toward the first reconcile pass that readiness waits for.
+	defer r.initialSync.reconciled(req.NamespacedName)
 
 	ingress := &netv1.Ingress{}
 	err = r.Get(ctx, req.NamespacedName, ingress)
@@ -119,10 +129,11 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// when ingress is added, install rule to loxilb-ingress
 	var models []loxiapi.LoadBalancerModel
+	var skipped []error
 	if _, isok := ingress.Annotations["loxilb.io/direct-loadbalance-service"]; isok {
-		models, err = r.createDirectLoxiModelList(ctx, ingress)
+		models, skipped, err = r.createDirectLoxiModelList(ctx, ingress)
 	} else {
-		models, err = r.createLoxiModelList(ctx, ingress)
+		models, skipped, err = r.createLoxiModelList(ctx, ingress)
 	}
 
 	if err != nil {
@@ -134,10 +145,18 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// Paths whose backends can't be resolved yet are left out; the rest are installed.
 	if err := r.syncRules(ctx, existingRules, models); err != nil {
 		r.clearProgrammedOrLog(ctx, ingress)
 		logger.Error(err, "failed to synchronize loxilb-ingress rules", "Ingress", req.NamespacedName)
 		return ctrl.Result{}, err
+	}
+
+	if len(models) == 0 && len(skipped) > 0 {
+		// No backend could be installed, so this Pod doesn't serve the Ingress at all.
+		r.clearProgrammedOrLog(ctx, ingress)
+		logger.Error(utilerrors.NewAggregate(skipped), "no Ingress backend could be installed. retrying", "Ingress", req.NamespacedName)
+		return ctrl.Result{RequeueAfter: backendRetryInterval}, nil
 	}
 
 	if err := r.updateIngressStatus(ctx, ingress); err != nil {
@@ -145,10 +164,17 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Report after the status update: the patch changes the resourceVersion that the status
-	// update relies on.
+	// update relies on. The report covers what was installed; skipped paths can't be served by any
+	// route until their backends are ready.
 	if err := r.markProgrammed(ctx, ingress); err != nil {
 		logger.Error(err, "failed to report programmed generation", "Ingress", req.NamespacedName, "key", r.ProgrammedKey)
 		return ctrl.Result{}, err
+	}
+
+	if len(skipped) > 0 {
+		logger.Error(utilerrors.NewAggregate(skipped), "some Ingress backends are not installed yet. retrying",
+			"Ingress", req.NamespacedName, "installed", len(models), "skipped", len(skipped))
+		return ctrl.Result{RequeueAfter: backendRetryInterval}, nil
 	}
 
 	logger.Info("Ingress reconciled successfully", "ingress", req.NamespacedName)
@@ -944,10 +970,12 @@ func (r *LoxilbIngressReconciler) getBackendServiceNamespace(ingress *netv1.Ingr
 	return ingress.Namespace
 }
 
-func (r *LoxilbIngressReconciler) createDirectLoxiModelList(ctx context.Context, ingress *netv1.Ingress) ([]loxiapi.LoadBalancerModel, error) {
+// createDirectLoxiModelList builds one rule per port of the direct-loadbalance Service. Ports that
+// have no endpoints yet are left out and returned in skipped.
+func (r *LoxilbIngressReconciler) createDirectLoxiModelList(ctx context.Context, ingress *netv1.Ingress) (models []loxiapi.LoadBalancerModel, skipped []error, err error) {
 	svcName, isSvc := ingress.Annotations["loxilb.io/direct-loadbalance-service"]
 	if !isSvc {
-		return nil, fmt.Errorf("no service name is set in the ingress annotation for direct-loadbalance")
+		return nil, nil, fmt.Errorf("no service name is set in the ingress annotation for direct-loadbalance")
 	}
 
 	svcNs, isNs := ingress.Annotations["loxilb.io/direct-loadbalance-namespace"]
@@ -962,17 +990,18 @@ func (r *LoxilbIngressReconciler) createDirectLoxiModelList(ctx context.Context,
 
 	svc := &corev1.Service{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: svcNs, Name: svcName}, svc); err != nil {
-		return nil, err
+		return nil, []error{fmt.Errorf("failed to get direct-loadbalance service %s/%s: %w", svcNs, svcName, err)}, nil
 	}
 
-	models := make([]loxiapi.LoadBalancerModel, 0)
+	models = make([]loxiapi.LoadBalancerModel, 0)
 	lbName := ingress.Name
 	for _, port := range svc.Spec.Ports {
 		protocol := string(port.Protocol)
 		loxisvc := r.createDirectLoxiLoadBalancerService(ingress.Namespace, lbName, "0.0.0.0", protocol, "", selStr, port.Port)
 		loxiep, err := r.createLoxiLoadBalancerEndpointsForServicePort(ctx, svc, port)
 		if err != nil {
-			return models, err
+			skipped = append(skipped, err)
+			continue
 		}
 
 		model := loxiapi.LoadBalancerModel{
@@ -980,14 +1009,17 @@ func (r *LoxilbIngressReconciler) createDirectLoxiModelList(ctx context.Context,
 			Endpoints: loxiep,
 		}
 		models = append(models, model)
-
 	}
 
-	return models, nil
+	return models, skipped, nil
 }
 
-func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingress *netv1.Ingress) ([]loxiapi.LoadBalancerModel, error) {
-	models := make([]loxiapi.LoadBalancerModel, 0)
+// createLoxiModelList builds one rule per Ingress path. A path whose backend can't be resolved yet
+// (no Service, no such port, or no endpoints) is left out and returned in skipped, so that one
+// failing backend doesn't take down the other paths. err is set only for errors that affect the
+// whole Ingress, such as invalid mTLS settings.
+func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingress *netv1.Ingress) (models []loxiapi.LoadBalancerModel, skipped []error, err error) {
+	models = make([]loxiapi.LoadBalancerModel, 0)
 	selStr, isSel := ingress.Annotations["loxilb.io/epselect"]
 	if !isSel {
 		selStr = pkg.EndPointSel_RR
@@ -996,12 +1028,12 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 	// Read mTLS configuration from Ingress annotations
 	mtlsFrontend, err := r.getMtlsFrontendConfig(ctx, ingress)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get mTLS frontend config: %w", err)
+		return nil, nil, fmt.Errorf("failed to get mTLS frontend config: %w", err)
 	}
 
 	mtlsBackend, err := r.getMtlsBackendConfig(ctx, ingress)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get mTLS backend config: %w", err)
+		return nil, nil, fmt.Errorf("failed to get mTLS backend config: %w", err)
 	}
 
 	for _, rule := range ingress.Spec.Rules {
@@ -1038,7 +1070,8 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, selStr, security, rule.Host, path.Path, pathType, mtlsFrontend, mtlsBackend)
 				loxiep, err := r.createLoxiLoadBalancerEndpointsForBackend(ctx, ns, path.Backend.Service)
 				if err != nil {
-					return models, err
+					skipped = append(skipped, fmt.Errorf("path %s%s: %w", rule.Host, path.Path, err))
+					continue
 				}
 
 				model := loxiapi.LoadBalancerModel{
@@ -1050,7 +1083,7 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 		}
 	}
 
-	return models, nil
+	return models, skipped, nil
 }
 
 func (r *LoxilbIngressReconciler) updateIngressStatus(ctx context.Context, ingress *netv1.Ingress) error {
@@ -1185,6 +1218,10 @@ func (r *LoxilbIngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 
 		return requests
+	}
+
+	if err := r.addInitialSyncRunnable(mgr); err != nil {
+		return err
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).

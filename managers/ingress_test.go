@@ -275,9 +275,9 @@ func TestCreateLoxiModelListUsesTargetPort(t *testing.T) {
 		testSlice("web", "web-1", []slicePort{{name: strPtr("http"), port: 8000}}, "10.1.0.1"),
 	)
 
-	models, err := r.createLoxiModelList(context.Background(), ingress)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	models, skipped, err := r.createLoxiModelList(context.Background(), ingress)
+	if err != nil || len(skipped) != 0 {
+		t.Fatalf("unexpected error: %v, skipped: %v", err, skipped)
 	}
 	if len(models) != 1 {
 		t.Fatalf("models = %d, want 1", len(models))

@@ -277,7 +277,12 @@ $ kubectl get ingress site -o jsonpath='{.metadata.generation}{"\n"}{.metadata.a
 
 Here `loxilb-ingress-x7k2p` serves the current spec, and `loxilb-ingress-m4q9z` hasn't installed it yet.
 
-* The value is written only after the rules are installed. A Pod removes its annotation when it can't install the rules (for example, the backend has no endpoints yet) or when it removes them.
+* The value is written only after the rules are installed. If some paths' backends can't be resolved yet (no Service, no such port, or no endpoints), the other paths are installed and the value is written; those paths can't be served until their backends are ready. A Pod removes its annotation when it can't install any path of the Ingress, or when it removes the rules.
 * When a container restarts, it removes its annotations at startup and writes them again after it reinstalls the rules. Annotations of Pods that no longer exist are left in place.
 * Pods that report carry the label `loxilb.io/programmed-report: "v1"`. Reporting needs the `POD_NAME` env and `patch` on `ingresses`, both in [manifests/loxilb-ingress-deploy.yml](manifests/loxilb-ingress-deploy.yml).
 * The Pod name must be 52 characters or shorter, because the part of the key after `loxilb.io/` can be at most 63 characters. A Pod with a longer name logs an error and doesn't report.
+
+## Backends that aren't ready and Pod readiness
+
+* A path whose backend can't be resolved yet is left out, and the other paths of the Ingress stay installed. The Ingress is reconciled again every 5 seconds until all of its paths are installed.
+* A loxilb-ingress Pod becomes Ready once its loxilb answers and every loxilb Ingress that existed when the controller started has been reconciled once. An Ingress that fails counts once it has been tried, so it doesn't keep Pods NotReady. The check is served at `:8081/readyz` and used by the `readinessProbe` in [manifests/loxilb-ingress-deploy.yml](manifests/loxilb-ingress-deploy.yml).
