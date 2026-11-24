@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -49,6 +51,13 @@ const (
 	// backendRetryInterval is how soon an Ingress with backends that couldn't be installed
 	// (for example, no endpoints yet) is reconciled again.
 	backendRetryInterval = 5 * time.Second
+
+	// defaultInactiveTimeout is the inactivity timeout, in seconds, of the HTTP and HTTPS rules of
+	// an Ingress without the loxilb.io/timeout annotation. It is the default kube-loxilb gives its
+	// own rules. loxilb's default of 240 closes a quiet WebSocket after four minutes.
+	defaultInactiveTimeout = 30 * 60
+	// maxInactiveTimeout is the longest inactivity timeout loxilb accepts.
+	maxInactiveTimeout = 24 * 60 * 60
 
 	// mTLS Frontend annotations
 	mtlsFrontendModeAnnotation      = "loxilb.io/mtls-frontend-mode"
@@ -121,7 +130,13 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Process TLS certificates before creating loxilb rules
 	if r.CertManager != nil && len(ingress.Spec.TLS) > 0 {
-		if err := r.CertManager.ProcessIngressTLS(ctx, ingress); err != nil {
+		providers, err := r.tlsHostProviders(ctx)
+		if err != nil {
+			logger.Error(err, "failed to process TLS certificates", "ingress", ingress.Name)
+			return ctrl.Result{}, err
+		}
+		providesHost := func(host string) bool { return providers[host] == req.NamespacedName }
+		if err := r.CertManager.ProcessIngressTLS(ctx, ingress, providesHost); err != nil {
 			logger.Error(err, "failed to process TLS certificates", "ingress", ingress.Name)
 			return ctrl.Result{}, err
 		}
@@ -275,10 +290,19 @@ func (r *LoxilbIngressReconciler) handleIngressDeleted(ctx context.Context, name
 	deleteErr := r.deleteManagedRules(ctx, existingRules)
 
 	if r.CertManager != nil {
-		httpsHosts := uniqueHTTPSHosts(existingRules)
-
-		if err := r.CertManager.CleanupIngressCertificates(ctx, httpsHosts); err != nil {
+		// A host that another Ingress still lists keeps its certificate.
+		if providers, err := r.tlsHostProviders(ctx); err != nil {
 			logger.Error(err, "failed to cleanup TLS certificates")
+		} else {
+			unusedHosts := make([]string, 0)
+			for _, host := range uniqueHTTPSHosts(existingRules) {
+				if _, used := providers[host]; !used {
+					unusedHosts = append(unusedHosts, host)
+				}
+			}
+			if err := r.CertManager.CleanupIngressCertificates(ctx, unusedHosts); err != nil {
+				logger.Error(err, "failed to cleanup TLS certificates")
+			}
 		}
 
 		if err := r.CertManager.CleanupIngressMtlsCertificates(ctx, namespace, ingressName); err != nil {
@@ -322,6 +346,10 @@ func serviceConfigChanged(existing, desired loxiapi.LoadBalancerService) bool {
 		return true
 	}
 	if existing.BackendProtocol != desired.BackendProtocol {
+		return true
+	}
+	// Rules installed without a timeout (direct-loadbalance) run with loxilb's default.
+	if desired.Timeout != 0 && existing.Timeout != desired.Timeout {
 		return true
 	}
 
@@ -807,6 +835,29 @@ func describeBackendPort(p netv1.ServiceBackendPort) string {
 	return fmt.Sprintf("%d", p.Number)
 }
 
+// inactiveTimeout returns the inactivity timeout, in seconds, for the HTTP and HTTPS rules of the
+// Ingress: the loxilb.io/timeout annotation, or defaultInactiveTimeout without it. A value that
+// isn't a positive number of seconds is ignored, and one above loxilb's limit is lowered to it,
+// so that a bad annotation doesn't keep the rules from being installed.
+func inactiveTimeout(ctx context.Context, ingress *netv1.Ingress) uint32 {
+	value, ok := ingress.Annotations[pkg.TimeoutAnnotation]
+	if !ok {
+		return defaultInactiveTimeout
+	}
+
+	logger := log.FromContext(ctx)
+	seconds, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || seconds <= 0 {
+		logger.Info("ignoring invalid timeout annotation", "annotation", pkg.TimeoutAnnotation, "value", value, "using", defaultInactiveTimeout)
+		return defaultInactiveTimeout
+	}
+	if seconds > maxInactiveTimeout {
+		logger.Info("timeout annotation is above the limit", "annotation", pkg.TimeoutAnnotation, "value", value, "using", maxInactiveTimeout)
+		return maxInactiveTimeout
+	}
+	return uint32(seconds)
+}
+
 func (r *LoxilbIngressReconciler) checkTLSHost(host string, TLS []netv1.IngressTLS) bool {
 	for _, tls := range TLS {
 		for _, tlsHost := range tls.Hosts {
@@ -962,7 +1013,7 @@ func (r *LoxilbIngressReconciler) getMtlsBackendConfig(ctx context.Context, ingr
 }
 
 func (r *LoxilbIngressReconciler) getBackendServiceNamespace(ingress *netv1.Ingress, backendName string) string {
-	if _, isok := ingress.Annotations["external-backend-service"]; isok {
+	if _, isok := ingress.Annotations[pkg.ExternalBackendServiceAnnotation]; isok {
 		if backendNamespace, isNs := ingress.Annotations["service-"+backendName+"-namespace"]; isNs {
 			return backendNamespace
 		}
@@ -1036,6 +1087,8 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 		return nil, nil, fmt.Errorf("failed to get mTLS backend config: %w", err)
 	}
 
+	timeout := inactiveTimeout(ctx, ingress)
+
 	for _, rule := range ingress.Spec.Rules {
 		if rule.HTTP == nil {
 			continue
@@ -1068,6 +1121,7 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 				}
 
 				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, selStr, security, rule.Host, path.Path, pathType, mtlsFrontend, mtlsBackend)
+				loxisvc.Timeout = timeout
 				loxiep, err := r.createLoxiLoadBalancerEndpointsForBackend(ctx, ns, path.Backend.Service)
 				if err != nil {
 					skipped = append(skipped, fmt.Errorf("path %s%s: %w", rule.Host, path.Path, err))
@@ -1224,65 +1278,90 @@ func (r *LoxilbIngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
+	// Only Ingress events are filtered. Secret and EndpointSlice events all go to their mappers,
+	// which pick the Ingresses that use the object.
+	ingressEvents := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			ingOld, okOld := e.ObjectOld.(*netv1.Ingress)
+			ingNew, okNew := e.ObjectNew.(*netv1.Ingress)
+			if !okOld || !okNew {
+				return false
+			}
+			if onlyOthersMarksChanged(ingOld, ingNew, r.ProgrammedKey) {
+				return false
+			}
+			// An Ingress that left the loxilb class still has rules to remove.
+			return checkIngClassNameFunc(ingNew) || checkIngClassNameFunc(ingOld)
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			ing, ok := e.Object.(*netv1.Ingress)
+			return ok && checkIngClassNameFunc(ing)
+		},
+		CreateFunc: func(e event.CreateEvent) bool {
+			ing, ok := e.Object.(*netv1.Ingress)
+			return ok && checkIngClassNameFunc(ing)
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			ing, ok := e.Object.(*netv1.Ingress)
+			return ok && checkIngClassNameFunc(ing)
+		},
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&netv1.Ingress{}).
+		For(&netv1.Ingress{}, builder.WithPredicates(ingressEvents)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(secretToIngressMapper)).
-		WithEventFilter(predicate.Funcs{
-			UpdateFunc: func(e event.UpdateEvent) bool {
-				if ingOld, ok := e.ObjectOld.(*netv1.Ingress); ok {
-					if ingNew, ok := e.ObjectNew.(*netv1.Ingress); ok && onlyOthersMarksChanged(ingOld, ingNew, r.ProgrammedKey) {
-						return false
-					}
-				}
-
-				if ingNew, ok := e.ObjectNew.(*netv1.Ingress); ok {
-					if checkIngClassNameFunc(ingNew) {
-						return true
-					}
-				}
-
-				if ingOld, ok := e.ObjectOld.(*netv1.Ingress); ok {
-					if checkIngClassNameFunc(ingOld) {
-						return true
-					}
-				}
-
-				if _, ok := e.ObjectNew.(*corev1.Secret); ok {
-					return true
-				}
-
-				return false
-			},
-			DeleteFunc: func(e event.DeleteEvent) bool {
-				ing, ok := e.Object.(*netv1.Ingress)
-				if ok {
-					return checkIngClassNameFunc(ing)
-				}
-				if _, ok := e.Object.(*corev1.Secret); ok {
-					return true
-				}
-				return false
-			},
-			CreateFunc: func(e event.CreateEvent) bool {
-				ing, ok := e.Object.(*netv1.Ingress)
-				if ok {
-					return checkIngClassNameFunc(ing)
-				}
-				if _, ok := e.Object.(*corev1.Secret); ok {
-					return true
-				}
-				return false
-			},
-			GenericFunc: func(e event.GenericEvent) bool {
-				ing, ok := e.Object.(*netv1.Ingress)
-				if ok {
-					return checkIngClassNameFunc(ing)
-				}
-				if _, ok := e.Object.(*corev1.Secret); ok {
-					return true
-				}
-				return false
-			},
-		}).
+		// Backend Pods come and go without the Ingress changing.
+		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.ingressesForEndpointSlice)).
 		Complete(r)
+}
+
+// ingressesForEndpointSlice maps a changed EndpointSlice to the Ingresses that take endpoints
+// from its Service.
+func (r *LoxilbIngressReconciler) ingressesForEndpointSlice(ctx context.Context, obj client.Object) []reconcile.Request {
+	svc := types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetLabels()[discoveryv1.LabelServiceName]}
+	if svc.Name == "" {
+		return nil
+	}
+
+	// Backends may be in another namespace than the Ingress, so every Ingress is looked at.
+	ingressList := &netv1.IngressList{}
+	if err := r.List(ctx, ingressList); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list Ingresses for an EndpointSlice change", "service", svc)
+		return nil
+	}
+
+	requests := []reconcile.Request{}
+	for i := range ingressList.Items {
+		ing := &ingressList.Items[i]
+		if isLoxilbIngress(ing) && r.usesBackendService(ing, svc) {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(ing)})
+		}
+	}
+
+	return requests
+}
+
+// usesBackendService reports whether the Ingress takes endpoints from the Service.
+func (r *LoxilbIngressReconciler) usesBackendService(ingress *netv1.Ingress, svc types.NamespacedName) bool {
+	if name, isDirect := ingress.Annotations[pkg.DirectLBServiceAnnotation]; isDirect {
+		ns, isNs := ingress.Annotations[pkg.DirectLBNamespaceAnnotation]
+		if !isNs {
+			ns = ingress.Namespace
+		}
+		return name == svc.Name && ns == svc.Namespace
+	}
+
+	for _, rule := range ingress.Spec.Rules {
+		if rule.HTTP == nil {
+			continue
+		}
+		for _, path := range rule.HTTP.Paths {
+			backend := path.Backend.Service
+			if backend != nil && backend.Name == svc.Name && r.getBackendServiceNamespace(ingress, backend.Name) == svc.Namespace {
+				return true
+			}
+		}
+	}
+
+	return false
 }

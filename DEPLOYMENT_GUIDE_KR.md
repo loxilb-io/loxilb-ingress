@@ -335,6 +335,9 @@ spec:
    - loxilb-ingress가 TLS 종료 수행
    - 백엔드 서비스로는 HTTP로 전달
    - Secret의 인증서는 `/opt/loxilb/cert/<hostname>/` 디렉토리에 저장됨
+   - 여러 Ingress가 같은 호스트를 쓰면 가장 먼저 만들어진 Ingress의 인증서를 쓰고, 그 호스트를 쓰는 마지막 Ingress가 삭제될 때만 인증서를 지움
+   - Secret이 바뀌면 새 인증서를 다시 등록함(기존 인증서를 먼저 지우므로, 그 사이의 새 연결에는 잠깐 기본 인증서가 나감)
+   - 와일드카드 호스트(`*.example.com`)는 loxilb가 매칭하며, Kubernetes Ingress 스펙과 달리 label이 둘 이상인 이름(`a.b.example.com`)에도 맞음. 자세한 내용은 README 참고
 
 2. **TLS가 없는 경우:**
    - 클라이언트는 HTTP (80 포트)로 연결
@@ -459,6 +462,24 @@ metadata:
     parent-gateway: "my-gateway"
     parent-gateway-namespace: "default"
 ```
+
+#### 5. 비활성 타임아웃
+
+**Annotation:** `loxilb.io/timeout`
+
+Ingress의 HTTP/HTTPS 규칙에서, 데이터가 오가지 않는 연결을 loxilb가 끊기까지의 시간(초)을 지정합니다.
+
+```yaml
+metadata:
+  annotations:
+    loxilb.io/timeout: "7200"  # 2시간
+```
+
+- 기본값: `1800`(30분). kube-loxilb의 기본값과 같습니다
+- 최댓값: `86400`(24시간). 더 큰 값은 최댓값으로 낮춥니다
+- 양의 정수(초)가 아닌 값은 무시하고 기본값을 씁니다
+- WebSocket처럼 오래 조용할 수 있는 연결에는 더 긴 값을 지정하세요
+- Direct LoadBalancing 모드의 규칙에는 적용되지 않습니다
 
 ### PathType 설정
 
@@ -927,6 +948,7 @@ curl -k https://myapp.example.com
 | `loxilb.io/direct-loadbalance-namespace` | Namespace | Direct LB 대상 Namespace |
 | `external-backend-service` | `"true"` | 외부 Namespace 백엔드 활성화 |
 | `service-<name>-namespace` | Namespace | 특정 서비스의 Namespace |
+| `loxilb.io/timeout` | 초 (기본 `1800`, 최대 `86400`) | HTTP/HTTPS 규칙의 비활성 타임아웃 |
 
 ### 지원 기능
 

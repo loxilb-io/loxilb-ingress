@@ -286,3 +286,52 @@ Here `loxilb-ingress-x7k2p` serves the current spec, and `loxilb-ingress-m4q9z` 
 
 * A path whose backend can't be resolved yet is left out, and the other paths of the Ingress stay installed. The Ingress is reconciled again every 5 seconds until all of its paths are installed.
 * A loxilb-ingress Pod becomes Ready once its loxilb answers and every loxilb Ingress that existed when the controller started has been reconciled once. An Ingress that fails counts once it has been tried, so it doesn't keep Pods NotReady. The check is served at `:8081/readyz` and used by the `readinessProbe` in [manifests/loxilb-ingress-deploy.yml](manifests/loxilb-ingress-deploy.yml).
+* When the Pods behind a backend Service change, the Ingresses that use the Service are reconciled right away. Every Ingress is also reconciled every 30 seconds.
+
+## Inactivity timeout
+
+loxilb closes a connection that has carried no data for the rule's inactivity timeout. The HTTP and HTTPS rules of an Ingress get 1800 seconds (30 minutes), the same default kube-loxilb gives its own rules. Set `loxilb.io/timeout` on the Ingress to change it:
+
+```
+metadata:
+  annotations:
+    loxilb.io/timeout: "7200"   # seconds
+```
+
+* Connections that stay open and can be quiet for long, such as a WebSocket behind a web terminal, need a timeout longer than their quiet periods.
+* The largest value is 86400 (24 hours); a larger one is lowered to it. A value that isn't a positive number of seconds is ignored, and the default is used.
+* kube-loxilb copies the annotations of an HTTPRoute to the Ingress it makes for it, so the annotation can be set on the HTTPRoute.
+* Rules of a `loxilb.io/direct-loadbalance-service` Ingress are not affected. They keep loxilb's own default.
+
+## TLS certificates
+
+loxilb keeps one certificate per host. loxilb-ingress writes the certificate of each `spec.tls` host to `/opt/loxilb/cert/<host>/` and registers it with loxilb.
+
+* **Hosts shared by Ingresses.** Several Ingresses may list the same host under `spec.tls`. The certificate then comes from the oldest of them that lists the host with a `secretName` (by creation time, then namespace and name); the certificate of another is used only while the host has none. It is removed when the last of them is deleted, not when any of them is.
+* **Renewal.** When the Secret's certificate or key changes, loxilb-ingress registers the new certificate. loxilb can't replace a registered certificate, so the old one is removed and the new one is registered right after it. Between the two calls, a new connection for the host gets the default certificate.
+* If the new certificate and key don't match, the certificate in use is kept, and the Ingress reports an error until the Secret is fixed.
+
+## Wildcard hosts
+
+loxilb-ingress passes the host of an Ingress rule and of `spec.tls` to loxilb as it is written. What a wildcard host such as `*.example.com` matches is therefore decided by the loxilb in the image, not by the Ingress specification:
+
+| | `a.example.com` | `a.b.example.com` | `example.com` |
+| --- | --- | --- | --- |
+| Kubernetes Ingress specification | matches | doesn't match | doesn't match |
+| loxilb (Gateway API meaning) | matches | matches | doesn't match |
+
+* With loxilb, a wildcard host matches more than one label, so an Ingress with `*.example.com` also receives requests for `a.b.example.com`.
+* Wildcard hosts need a loxilb that supports them. The current base image (`loxilb-inference-gateway:v0.9.9.1`) doesn't route by a wildcard host and doesn't select a wildcard certificate by SNI.
+
+## Backends in other namespaces
+
+An Ingress refers to Services in its own namespace. To use a Service in another namespace, set `external-backend-service` and name the Service's namespace in `service-<Service name>-namespace`:
+
+```
+metadata:
+  annotations:
+    external-backend-service: "true"
+    service-api-namespace: "backends"   # the Service "api" is in the namespace "backends"
+```
+
+kube-loxilb sets these on the Ingresses it makes from HTTPRoutes whose backends are in another namespace than the Ingress.

@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +29,16 @@ type fakeLoxilb struct {
 	srv   *httptest.Server
 	// failing makes every request fail, as a loxilb that isn't serving its API yet.
 	failing bool
+	// ruleCreates counts the rules created so far.
+	ruleCreates int
+
+	// certDir is where SNI certificates are read from when they are registered.
+	certDir string
+	// sni holds, per registered host, the certificate file content read at registration.
+	// Like loxilb, it doesn't read the file again afterwards.
+	sni map[string]string
+	// sniRegistrations counts the certificates loaded so far.
+	sniRegistrations int
 }
 
 func newFakeLoxilb(t *testing.T) *fakeLoxilb {
@@ -39,6 +51,7 @@ func newFakeLoxilb(t *testing.T) *fakeLoxilb {
 
 func (f *fakeLoxilb) serve(w http.ResponseWriter, req *http.Request) {
 	const base = "/netlox/v1/config/loadbalancer"
+	const sniBase = "/netlox/v1/sni/certificates"
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failing {
@@ -48,6 +61,10 @@ func (f *fakeLoxilb) serve(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	switch {
+	case req.URL.Path == sniBase && (req.Method == http.MethodPost || req.Method == http.MethodDelete):
+		// loxilb answers these with 200 and tells the outcome in the result.
+		_ = json.NewEncoder(w).Encode(map[string]string{"result": f.serveSNI(req)})
+		return
 	case req.Method == http.MethodGet && req.URL.Path == base+"/all":
 		_ = json.NewEncoder(w).Encode(loxiapi.LoadBalancerListModel{Item: f.rules})
 		return
@@ -58,6 +75,7 @@ func (f *fakeLoxilb) serve(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		f.rules = append(f.rules, model)
+		f.ruleCreates++
 	case req.Method == http.MethodDelete && strings.HasPrefix(req.URL.Path, base+"/name/"):
 		name := strings.TrimPrefix(req.URL.Path, base+"/name/")
 		kept := f.rules[:0]
@@ -72,6 +90,38 @@ func (f *fakeLoxilb) serve(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]string{"result": "Success"})
+}
+
+// serveSNI registers or removes an SNI certificate the way loxilb does, and returns the result.
+func (f *fakeLoxilb) serveSNI(req *http.Request) string {
+	var model loxiapi.SniCertModel
+	if err := json.NewDecoder(req.Body).Decode(&model); err != nil || model.Hostname == "" {
+		return "Error: invalid request"
+	}
+	host := model.Hostname
+	_, registered := f.sni[host]
+
+	if req.Method == http.MethodDelete {
+		if !registered {
+			return "Error: Certificate for " + host + " not found"
+		}
+		delete(f.sni, host)
+		return "Success"
+	}
+
+	if registered {
+		return "Error: Certificate already registered for " + host
+	}
+	certData, err := os.ReadFile(filepath.Join(f.certDir, host, "server.crt"))
+	if err != nil {
+		return "Error: Failed to load certificate for " + host
+	}
+	if f.sni == nil {
+		f.sni = map[string]string{}
+	}
+	f.sni[host] = string(certData)
+	f.sniRegistrations++
+	return "Success"
 }
 
 func (f *fakeLoxilb) client(t *testing.T) *loxiapi.LoxiClient {
