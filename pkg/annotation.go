@@ -1,11 +1,16 @@
 package pkg
 
 const (
-	// AnnotationKey is the key for the annotation
-	ExternalBackendServiceAnnotation = "external-backend-service" // Deprecated
+	// ExternalBackendServiceAnnotation marks an Ingress whose backend Services may be in other
+	// namespaces. The namespace of a backend is in the annotation service-<name>-namespace.
+	// kube-loxilb sets both on the Ingresses it makes from HTTPRoutes.
+	ExternalBackendServiceAnnotation = "external-backend-service"
 	DirectLBServiceAnnotation        = "loxilb.io/direct-loadbalance-service"
 	DirectLBNamespaceAnnotation      = "loxilb.io/direct-loadbalance-namespace"
 	EndPointSelAnnotation            = "loxilb.io/epselect"
+	// TimeoutAnnotation is the inactivity timeout, in seconds, of an Ingress's HTTP and HTTPS
+	// rules. kube-loxilb reads the same annotation on Services.
+	TimeoutAnnotation = "loxilb.io/timeout"
 )
 
 const (

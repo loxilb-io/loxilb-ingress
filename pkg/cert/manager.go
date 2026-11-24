@@ -18,10 +18,13 @@ package cert
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	loxiapi "github.com/loxilb-io/kube-loxilb/pkg/api"
 	corev1 "k8s.io/api/core/v1"
@@ -32,26 +35,41 @@ import (
 )
 
 const (
-	certBaseDir       = "/opt/loxilb/cert"
-	certFile          = "server.crt"
-	keyFile           = "server.key"
-	mtlsClientBaseDir = "/opt/loxilb/cert/client"
+	certBaseDir = "/opt/loxilb/cert"
+	certFile    = "server.crt"
+	keyFile     = "server.key"
+	// mtlsClientSubDir is the directory under the certificate directory that holds mTLS files.
+	mtlsClientSubDir = "client"
 )
 
 type Manager struct {
 	client.Client
 	LoxiClient *loxiapi.LoxiClient
+	// CertDir is the directory loxilb reads host certificates from, one subdirectory per host.
+	CertDir string
+
+	mu sync.Mutex
+	// loaded holds, per host, the digest of the certificate and key loxilb was last told to load.
+	// loxilb keeps a certificate in memory once it is registered, so the files alone don't tell
+	// what it serves.
+	loaded map[string][sha256.Size]byte
 }
 
 func NewManager(c client.Client, loxiClient *loxiapi.LoxiClient) *Manager {
 	return &Manager{
 		Client:     c,
 		LoxiClient: loxiClient,
+		CertDir:    certBaseDir,
+		loaded:     make(map[string][sha256.Size]byte),
 	}
 }
 
-// ProcessIngressTLS processes TLS configuration from Ingress and stores certificates to filesystem
-func (m *Manager) ProcessIngressTLS(ctx context.Context, ingress *netv1.Ingress) error {
+// ProcessIngressTLS registers the certificates of the Ingress's TLS hosts with loxilb.
+// providesHost tells whether this Ingress is the one that provides the certificate of a host;
+// several Ingresses may list the same host, and loxilb keeps one certificate per host. For a
+// host that another Ingress provides, this Ingress's certificate is registered only while the
+// host has none, and never replaces the one in use.
+func (m *Manager) ProcessIngressTLS(ctx context.Context, ingress *netv1.Ingress, providesHost func(host string) bool) error {
 	logger := log.FromContext(ctx)
 
 	if len(ingress.Spec.TLS) == 0 {
@@ -59,41 +77,122 @@ func (m *Manager) ProcessIngressTLS(ctx context.Context, ingress *netv1.Ingress)
 		return nil
 	}
 
-	for _, tls := range ingress.Spec.TLS {
-		if tls.SecretName == "" {
-			logger.Info("TLS entry has no secret name, skipping", "hosts", tls.Hosts)
+	// A host listed in more than one TLS entry takes the certificate of the first one.
+	done := make(map[string]struct{})
+
+	for _, entry := range ingress.Spec.TLS {
+		if entry.SecretName == "" {
+			logger.Info("TLS entry has no secret name, skipping", "hosts", entry.Hosts)
 			continue
 		}
 
 		// Get secret from Kubernetes
-		secret, err := m.getSecret(ctx, ingress.Namespace, tls.SecretName)
+		secret, err := m.getSecret(ctx, ingress.Namespace, entry.SecretName)
 		if err != nil {
-			return fmt.Errorf("failed to get secret %s/%s: %w", ingress.Namespace, tls.SecretName, err)
+			return fmt.Errorf("failed to get secret %s/%s: %w", ingress.Namespace, entry.SecretName, err)
 		}
 
 		// Extract certificate and key from secret
 		certData, keyData, err := m.extractCertificateFromSecret(secret)
 		if err != nil {
-			return fmt.Errorf("failed to extract certificate from secret %s: %w", tls.SecretName, err)
+			return fmt.Errorf("failed to extract certificate from secret %s: %w", entry.SecretName, err)
 		}
 
-		// Store certificates for each host
-		for _, host := range tls.Hosts {
-			if err := m.storeCertificateForHost(ctx, host, certData, keyData); err != nil {
-				return fmt.Errorf("failed to store certificate for host %s: %w", host, err)
+		for _, host := range entry.Hosts {
+			if _, ok := done[host]; ok {
+				continue
 			}
-			logger.Info("stored certificate for host", "host", host, "secret", tls.SecretName)
-			if err := m.LoxiClient.SniCert().Create(ctx, &loxiapi.SniCertModel{Hostname: host}); err != nil {
-				// Ignore error if the certificate is already registered
-				if !strings.Contains(err.Error(), "already registered") {
-					return fmt.Errorf("failed to call LoxiLB API create SNI certificate for host %s: %w", host, err)
-				}
-				logger.Info("SNI certificate already registered, skipping", "host", host)
+			done[host] = struct{}{}
+
+			mayReplace := providesHost == nil || providesHost(host)
+			if err := m.ensureHostCertificate(ctx, host, certData, keyData, mayReplace); err != nil {
+				return fmt.Errorf("host %s (secret %s): %w", host, entry.SecretName, err)
 			}
 		}
 	}
 
 	return nil
+}
+
+// ensureHostCertificate makes loxilb serve a certificate for host: certData and keyData, or the
+// one it already serves when that differs and mayReplace is false.
+//
+// The certificate is registered on every call, because a restarted loxilb has lost it. loxilb
+// refuses a host it already has and has no call to replace a certificate, so when the content
+// differs from what it loaded, the certificate is removed and registered again. The host has no
+// certificate of its own between the two calls.
+//
+// The files of a host are in place once this has returned without error. loxilb also reads them
+// when it creates the HTTPS rule of the host.
+func (m *Manager) ensureHostCertificate(ctx context.Context, host string, certData, keyData []byte, mayReplace bool) error {
+	logger := log.FromContext(ctx)
+	digest := certificateDigest(certData, keyData)
+	sni := &loxiapi.SniCertModel{Hostname: host}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	loaded, known := m.loaded[host]
+	if known && loaded != digest && !mayReplace {
+		// Another Ingress provides this host's certificate. The files hold what was loaded, so
+		// registering puts it back if loxilb lost it and changes nothing otherwise.
+		if err := m.LoxiClient.SniCert().Create(ctx, sni); err != nil && !strings.Contains(err.Error(), "already registered") {
+			return fmt.Errorf("failed to call LoxiLB API create SNI certificate: %w", err)
+		}
+		return nil
+	}
+	changed := !known || loaded != digest
+
+	if known && changed {
+		// The certificate in use is removed before the new one is loaded, so a pair that can't
+		// be loaded would leave the host without one. Keep the old one in that case.
+		if _, err := tls.X509KeyPair(certData, keyData); err != nil {
+			return fmt.Errorf("keeping the certificate in use: the new certificate and key are not a valid pair: %w", err)
+		}
+	}
+
+	if changed {
+		// loxilb reads the files only when the certificate is registered.
+		if err := m.storeCertificateForHost(ctx, host, certData, keyData); err != nil {
+			return fmt.Errorf("failed to store certificate: %w", err)
+		}
+	}
+
+	err := m.LoxiClient.SniCert().Create(ctx, sni)
+	if err == nil {
+		m.loaded[host] = digest
+		logger.Info("registered SNI certificate", "host", host)
+		return nil
+	}
+	if !strings.Contains(err.Error(), "already registered") {
+		return fmt.Errorf("failed to call LoxiLB API create SNI certificate: %w", err)
+	}
+	if !changed {
+		return nil
+	}
+
+	logger.Info("certificate changed. registering it again", "host", host)
+	if err := m.LoxiClient.SniCert().Delete(ctx, sni); err != nil {
+		return fmt.Errorf("failed to call LoxiLB API delete SNI certificate: %w", err)
+	}
+	delete(m.loaded, host)
+	if err := m.LoxiClient.SniCert().Create(ctx, sni); err != nil {
+		return fmt.Errorf("failed to call LoxiLB API create SNI certificate: %w", err)
+	}
+	m.loaded[host] = digest
+
+	return nil
+}
+
+func certificateDigest(certData, keyData []byte) [sha256.Size]byte {
+	h := sha256.New()
+	h.Write(certData)
+	h.Write([]byte{0})
+	h.Write(keyData)
+
+	var digest [sha256.Size]byte
+	copy(digest[:], h.Sum(nil))
+	return digest
 }
 
 // getSecret retrieves a secret from Kubernetes
@@ -175,7 +274,7 @@ func (m *Manager) storeCertificateForHost(ctx context.Context, hostname string, 
 	logger := log.FromContext(ctx)
 
 	// Create host-specific directory
-	hostDir := filepath.Join(certBaseDir, hostname)
+	hostDir := filepath.Join(m.CertDir, hostname)
 	if err := os.MkdirAll(hostDir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", hostDir, err)
 	}
@@ -197,13 +296,19 @@ func (m *Manager) storeCertificateForHost(ctx context.Context, hostname string, 
 	return nil
 }
 
-// CleanupIngressCertificates removes certificate files for all hosts in the ingress
+// CleanupIngressCertificates removes the certificates of the given hosts from the filesystem and
+// from loxilb. The caller leaves out hosts that another Ingress still uses.
 func (m *Manager) CleanupIngressCertificates(ctx context.Context, httpsHostName []string) error {
 	logger := log.FromContext(ctx)
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if len(httpsHostName) != 0 {
 		for _, httpsHostName := range httpsHostName {
-			hostDir := filepath.Join(certBaseDir, httpsHostName)
+			delete(m.loaded, httpsHostName)
+
+			hostDir := filepath.Join(m.CertDir, httpsHostName)
 			if err := os.RemoveAll(hostDir); err != nil {
 				logger.Error(err, "failed to remove certificate directory", "host", httpsHostName, "path", hostDir)
 			} else {
@@ -220,7 +325,7 @@ func (m *Manager) CleanupIngressCertificates(ctx context.Context, httpsHostName 
 
 // getMtlsCertBasePath returns the base path for mTLS certificates
 func (m *Manager) getMtlsCertBasePath(namespace, ingressName string) string {
-	return filepath.Join(mtlsClientBaseDir, namespace, ingressName)
+	return filepath.Join(m.CertDir, mtlsClientSubDir, namespace, ingressName)
 }
 
 // StoreMtlsFrontendCert stores frontend mTLS CA certificate and returns the file path

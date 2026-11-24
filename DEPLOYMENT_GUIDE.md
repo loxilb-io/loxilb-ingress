@@ -335,6 +335,9 @@ spec:
    - loxilb-ingress performs TLS termination
    - Traffic is forwarded to backend services via HTTP
    - Secret certificates are stored in `/opt/loxilb/cert/<hostname>/` directory
+   - When several Ingresses list the same host, the certificate comes from the oldest Ingress, and it is removed only when the last of them is deleted
+   - When the Secret changes, the new certificate is registered again (the old one is removed first, so new connections get the default certificate for a moment)
+   - A wildcard host (`*.example.com`) is matched by loxilb, which also matches more than one label (`a.b.example.com`), unlike the Kubernetes Ingress specification. See the README for details
 
 2. **Without TLS:**
    - Clients connect via HTTP (port 80)
@@ -459,6 +462,24 @@ metadata:
     parent-gateway: "my-gateway"
     parent-gateway-namespace: "default"
 ```
+
+#### 5. Inactivity Timeout
+
+**Annotation:** `loxilb.io/timeout`
+
+Sets how long, in seconds, a connection of the Ingress's HTTP and HTTPS rules may stay without data before loxilb closes it.
+
+```yaml
+metadata:
+  annotations:
+    loxilb.io/timeout: "7200"  # 2 hours
+```
+
+- Default: `1800` (30 minutes), the same as kube-loxilb's default
+- Maximum: `86400` (24 hours); a larger value is lowered to it
+- A value that isn't a positive number of seconds is ignored, and the default is used
+- Use a longer timeout for connections that can be quiet for long, such as WebSockets
+- Not applied to Direct LoadBalancing mode rules
 
 ### PathType Configuration
 
@@ -927,6 +948,7 @@ curl -k https://myapp.example.com
 | `loxilb.io/direct-loadbalance-namespace` | Namespace | Direct LB target Namespace |
 | `external-backend-service` | `"true"` | Enable external Namespace backends |
 | `service-<name>-namespace` | Namespace | Namespace for specific service |
+| `loxilb.io/timeout` | Seconds (default `1800`, max `86400`) | Inactivity timeout of HTTP/HTTPS rules |
 
 ### Supported Features
 
