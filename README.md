@@ -303,12 +303,19 @@ metadata:
 * kube-loxilb copies the annotations of an HTTPRoute to the Ingress it makes for it, so the annotation can be set on the HTTPRoute.
 * Rules of a `loxilb.io/direct-loadbalance-service` Ingress are not affected. They keep loxilb's own default.
 
+**Limitation: the value is per port, not per Ingress.** loxilb (v0.9.9.1, the current base image) doesn't take the timeout of a connection from the rule that serves it. When it accepts a connection, it takes the timeout of the oldest rule on the port. All HTTP rules of a Pod are on port 80 and all HTTPS rules are on port 443, so:
+
+* The annotation of an Ingress applies to every connection on the port while that Ingress has the oldest rule there. Otherwise it applies to none, also not to the Ingress's own connections.
+* Changing the annotation installs the rules of the Ingress again, which makes them the newest on the port. The new value then usually doesn't apply.
+* An Ingress with a short timeout and the oldest rule closes the quiet connections of every Ingress on the port.
+* The timeout is dependable only when every Ingress on the port has the same value. That is the case when none has the annotation: every connection gets 1800 seconds.
+
 ## TLS certificates
 
 loxilb keeps one certificate per host. loxilb-ingress writes the certificate of each `spec.tls` host to `/opt/loxilb/cert/<host>/` and registers it with loxilb.
 
 * **Hosts shared by Ingresses.** Several Ingresses may list the same host under `spec.tls`. The certificate then comes from the oldest of them that lists the host with a `secretName` (by creation time, then namespace and name); the certificate of another is used only while the host has none. It is removed when the last of them is deleted, not when any of them is.
-* **Renewal.** When the Secret's certificate or key changes, loxilb-ingress registers the new certificate. loxilb can't replace a registered certificate, so the old one is removed and the new one is registered right after it. Between the two calls, a new connection for the host gets the default certificate.
+* **Renewal.** When the Secret's certificate or key changes, loxilb-ingress registers the new certificate. loxilb can't replace a registered certificate, so the old one is removed and the new one is registered right after it. Between the two calls, a new connection for the host gets the certificate of the port's listener instead of its own. That is the certificate of the rule the listener was created for, so usually another host's, and a client that verifies the certificate fails the handshake.
 * If the new certificate and key don't match, the certificate in use is kept, and the Ingress reports an error until the Secret is fixed.
 
 ## Wildcard hosts

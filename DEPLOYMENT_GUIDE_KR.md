@@ -336,7 +336,7 @@ spec:
    - 백엔드 서비스로는 HTTP로 전달
    - Secret의 인증서는 `/opt/loxilb/cert/<hostname>/` 디렉토리에 저장됨
    - 여러 Ingress가 같은 호스트를 쓰면 가장 먼저 만들어진 Ingress의 인증서를 쓰고, 그 호스트를 쓰는 마지막 Ingress가 삭제될 때만 인증서를 지움
-   - Secret이 바뀌면 새 인증서를 다시 등록함(기존 인증서를 먼저 지우므로, 그 사이의 새 연결에는 잠깐 기본 인증서가 나감)
+   - Secret이 바뀌면 새 인증서를 다시 등록함(기존 인증서를 먼저 지우므로, 그 사이 그 호스트의 새 연결에는 잠깐 다른 호스트의 인증서가 나감)
    - 와일드카드 호스트(`*.example.com`)는 loxilb가 매칭하며, Kubernetes Ingress 스펙과 달리 label이 둘 이상인 이름(`a.b.example.com`)에도 맞음. 자세한 내용은 README 참고
 
 2. **TLS가 없는 경우:**
@@ -480,6 +480,7 @@ metadata:
 - 양의 정수(초)가 아닌 값은 무시하고 기본값을 씁니다
 - WebSocket처럼 오래 조용할 수 있는 연결에는 더 긴 값을 지정하세요
 - Direct LoadBalancing 모드의 규칙에는 적용되지 않습니다
+- **제한:** 현재 loxilb는 한 포트(80 또는 443)의 모든 연결에 그 포트에서 가장 오래된 규칙의 타임아웃을 적용하므로, 값이 Ingress별로 걸리지 않습니다. 모든 Ingress에 같은 값을 쓰거나 annotation을 쓰지 마세요. 자세한 내용은 README 참고
 
 ### PathType 설정
 
