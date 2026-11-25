@@ -286,3 +286,59 @@ func TestOldestIngressProvidesSharedHostCertificate(t *testing.T) {
 		t.Fatalf("served certificate = %q, want the remaining Ingress's", got)
 	}
 }
+
+// Newer loxilb builds answer a failed SNI call with an error status instead of 200. The result
+// text, which is what the outcome is read from, stays the same.
+func TestSNICallsWithErrorStatus(t *testing.T) {
+	ctx := context.Background()
+	oldCert, oldKey := testKeyPair(t, "old")
+	newCert, newKey := testKeyPair(t, "new")
+	secret := tlsSecret("tls", oldCert, oldKey)
+	pod := newTLSTestPod(t, secret, tlsIngress("web", "tls"))
+	pod.loxilb.sniStatusCodes = true
+
+	// Registered again on every reconcile: "already registered" now comes as 409.
+	reconcileOK(t, pod.r, "web")
+	reconcileOK(t, pod.r, "web")
+	if got := servedCert(pod.loxilb); got != string(oldCert) {
+		t.Fatalf("served certificate = %q, want the old one", got)
+	}
+
+	// A renewal still removes and registers.
+	secret.Data = map[string][]byte{"tls.crt": newCert, "tls.key": newKey}
+	if err := pod.r.Client.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOK(t, pod.r, "web")
+	if got := servedCert(pod.loxilb); got != string(newCert) {
+		t.Fatalf("served certificate after renewal = %q, want the new one", got)
+	}
+
+	// loxilb loses the certificate between the refused registration and the removal: the
+	// removal answers 404, and the new certificate is registered all the same.
+	secret.Data = map[string][]byte{"tls.crt": oldCert, "tls.key": oldKey}
+	if err := pod.r.Client.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	pod.loxilb.mu.Lock()
+	pod.loxilb.sniLoseOnConflict = true
+	pod.loxilb.mu.Unlock()
+	reconcileOK(t, pod.r, "web")
+	if got := servedCert(pod.loxilb); got != string(oldCert) {
+		t.Fatalf("served certificate after loxilb lost it = %q, want the Secret's", got)
+	}
+	pod.loxilb.mu.Lock()
+	pod.loxilb.sniLoseOnConflict = false
+	pod.loxilb.mu.Unlock()
+
+	// The Ingress is deleted after loxilb came back empty: there is no certificate to remove
+	// (404), and the files are cleaned up as usual.
+	pod.loxilb.mu.Lock()
+	pod.loxilb.sni = nil
+	pod.loxilb.mu.Unlock()
+	deleteIngress(t, pod.r.Client, "web")
+	reconcileOK(t, pod.r, "web")
+	if _, err := os.Stat(filepath.Join(pod.loxilb.certDir, tlsHost)); !os.IsNotExist(err) {
+		t.Fatalf("certificate files still there after the Ingress was deleted (err = %v)", err)
+	}
+}
