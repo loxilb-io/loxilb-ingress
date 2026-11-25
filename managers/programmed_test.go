@@ -39,6 +39,12 @@ type fakeLoxilb struct {
 	sni map[string]string
 	// sniRegistrations counts the certificates loaded so far.
 	sniRegistrations int
+	// sniStatusCodes makes a failed SNI call answer with an error status (400, 404, 409) instead
+	// of 200, as newer loxilb builds do. The result text is the same either way.
+	sniStatusCodes bool
+	// sniLoseOnConflict drops a host's certificate right after refusing to register it again,
+	// as a loxilb that restarts between two calls.
+	sniLoseOnConflict bool
 }
 
 func newFakeLoxilb(t *testing.T) *fakeLoxilb {
@@ -62,8 +68,12 @@ func (f *fakeLoxilb) serve(w http.ResponseWriter, req *http.Request) {
 
 	switch {
 	case req.URL.Path == sniBase && (req.Method == http.MethodPost || req.Method == http.MethodDelete):
-		// loxilb answers these with 200 and tells the outcome in the result.
-		_ = json.NewEncoder(w).Encode(map[string]string{"result": f.serveSNI(req)})
+		// loxilb tells the outcome in the result. Older builds answer 200 also when the call failed.
+		status, result := f.serveSNI(req)
+		if f.sniStatusCodes {
+			w.WriteHeader(status)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"result": result})
 		return
 	case req.Method == http.MethodGet && req.URL.Path == base+"/all":
 		_ = json.NewEncoder(w).Encode(loxiapi.LoadBalancerListModel{Item: f.rules})
@@ -109,36 +119,40 @@ func sameRuleKey(a, b loxiapi.LoadBalancerService) bool {
 		a.Host == b.Host && a.PathPrefix == b.PathPrefix && a.PathMatchMode == b.PathMatchMode
 }
 
-// serveSNI registers or removes an SNI certificate the way loxilb does, and returns the result.
-func (f *fakeLoxilb) serveSNI(req *http.Request) string {
+// serveSNI registers or removes an SNI certificate the way loxilb does. It returns the result
+// text and the status that goes with it when loxilb answers failures with an error status.
+func (f *fakeLoxilb) serveSNI(req *http.Request) (int, string) {
 	var model loxiapi.SniCertModel
 	if err := json.NewDecoder(req.Body).Decode(&model); err != nil || model.Hostname == "" {
-		return "Error: invalid request"
+		return http.StatusBadRequest, "Error: invalid request"
 	}
 	host := model.Hostname
 	_, registered := f.sni[host]
 
 	if req.Method == http.MethodDelete {
 		if !registered {
-			return "Error: Certificate for " + host + " not found"
+			return http.StatusNotFound, "Error: Certificate for " + host + " not found"
 		}
 		delete(f.sni, host)
-		return "Success"
+		return http.StatusOK, "Success"
 	}
 
 	if registered {
-		return "Error: Certificate already registered for " + host
+		if f.sniLoseOnConflict {
+			delete(f.sni, host)
+		}
+		return http.StatusConflict, "Error: Certificate already registered for " + host
 	}
 	certData, err := os.ReadFile(filepath.Join(f.certDir, host, "server.crt"))
 	if err != nil {
-		return "Error: Failed to load certificate for " + host
+		return http.StatusBadRequest, "Error: Failed to load certificate for " + host
 	}
 	if f.sni == nil {
 		f.sni = map[string]string{}
 	}
 	f.sni[host] = string(certData)
 	f.sniRegistrations++
-	return "Success"
+	return http.StatusOK, "Success"
 }
 
 func (f *fakeLoxilb) client(t *testing.T) *loxiapi.LoxiClient {

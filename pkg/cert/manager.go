@@ -136,7 +136,7 @@ func (m *Manager) ensureHostCertificate(ctx context.Context, host string, certDa
 	if known && loaded != digest && !mayReplace {
 		// Another Ingress provides this host's certificate. The files hold what was loaded, so
 		// registering puts it back if loxilb lost it and changes nothing otherwise.
-		if err := m.LoxiClient.SniCert().Create(ctx, sni); err != nil && !strings.Contains(err.Error(), "already registered") {
+		if err := m.LoxiClient.SniCert().Create(ctx, sni); err != nil && !sniAlreadyRegistered(err) {
 			return fmt.Errorf("failed to call LoxiLB API create SNI certificate: %w", err)
 		}
 		return nil
@@ -164,7 +164,7 @@ func (m *Manager) ensureHostCertificate(ctx context.Context, host string, certDa
 		logger.Info("registered SNI certificate", "host", host)
 		return nil
 	}
-	if !strings.Contains(err.Error(), "already registered") {
+	if !sniAlreadyRegistered(err) {
 		return fmt.Errorf("failed to call LoxiLB API create SNI certificate: %w", err)
 	}
 	if !changed {
@@ -172,7 +172,8 @@ func (m *Manager) ensureHostCertificate(ctx context.Context, host string, certDa
 	}
 
 	logger.Info("certificate changed. registering it again", "host", host)
-	if err := m.LoxiClient.SniCert().Delete(ctx, sni); err != nil {
+	// A certificate that is gone by now, as after a loxilb restart, needs no removing.
+	if err := m.LoxiClient.SniCert().Delete(ctx, sni); err != nil && !sniNotRegistered(err) {
 		return fmt.Errorf("failed to call LoxiLB API delete SNI certificate: %w", err)
 	}
 	delete(m.loaded, host)
@@ -182,6 +183,20 @@ func (m *Manager) ensureHostCertificate(ctx context.Context, host string, certDa
 	m.loaded[host] = digest
 
 	return nil
+}
+
+// loxilb tells the outcome of an SNI call in the text of its result, and the client hands that
+// text on as the error. It may come with HTTP 200 or with an error status, depending on the
+// loxilb build; the text is the same.
+
+// sniAlreadyRegistered reports whether registering failed because the host has a certificate.
+func sniAlreadyRegistered(err error) bool {
+	return strings.Contains(err.Error(), "already registered")
+}
+
+// sniNotRegistered reports whether removing failed because the host has no certificate.
+func sniNotRegistered(err error) bool {
+	return strings.Contains(err.Error(), "not found")
 }
 
 func certificateDigest(certData, keyData []byte) [sha256.Size]byte {
@@ -315,7 +330,7 @@ func (m *Manager) CleanupIngressCertificates(ctx context.Context, httpsHostName 
 				logger.Info("removed certificate directory", "host", httpsHostName, "path", hostDir)
 			}
 
-			if err := m.LoxiClient.SniCert().Delete(ctx, &loxiapi.SniCertModel{Hostname: httpsHostName}); err != nil {
+			if err := m.LoxiClient.SniCert().Delete(ctx, &loxiapi.SniCertModel{Hostname: httpsHostName}); err != nil && !sniNotRegistered(err) {
 				logger.Error(err, "failed to call LoxiLB API delete SNI certificate", "host", httpsHostName)
 			}
 		}
