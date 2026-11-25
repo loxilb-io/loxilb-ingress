@@ -336,7 +336,7 @@ spec:
    - Traffic is forwarded to backend services via HTTP
    - Secret certificates are stored in `/opt/loxilb/cert/<hostname>/` directory
    - When several Ingresses list the same host, the certificate comes from the oldest Ingress, and it is removed only when the last of them is deleted
-   - When the Secret changes, the new certificate is registered again (the old one is removed first, so new connections get the default certificate for a moment)
+   - When the Secret changes, the new certificate is registered again (the old one is removed first, so for a moment new connections for the host get another host's certificate)
    - A wildcard host (`*.example.com`) is matched by loxilb, which also matches more than one label (`a.b.example.com`), unlike the Kubernetes Ingress specification. See the README for details
 
 2. **Without TLS:**
@@ -480,6 +480,7 @@ metadata:
 - A value that isn't a positive number of seconds is ignored, and the default is used
 - Use a longer timeout for connections that can be quiet for long, such as WebSockets
 - Not applied to Direct LoadBalancing mode rules
+- **Limitation:** loxilb currently gives every connection on a port (80 or 443) the timeout of the oldest rule on that port, so the value isn't applied per Ingress. Use the same value on every Ingress, or none. See the README for details
 
 ### PathType Configuration
 
