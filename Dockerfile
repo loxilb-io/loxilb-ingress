@@ -1,6 +1,8 @@
 # loxilb-ingress needs the SNI certificate API (/netlox/v1/sni/certificates) and mTLS support.
 # loxilb-inference-gateway has both; the open-source loxilb image has neither.
-ARG LOXILB_IMG="ghcr.io/loxilb-io/loxilb-inference-gateway:v0.9.9.1"
+# TEST BUILD, not for merging: the base is loxilb-inference-gateway main (gateway 6f8ab04f),
+# pinned by digest because its "latest" tag moves with every push to main.
+ARG LOXILB_IMG="ghcr.io/loxilb-io/loxilb-inference-gateway@sha256:d0910127f6860efc1a8c6f9c3d78524a131557f5aa6f31d04784bd6507de912d"
 FROM golang:1.23-alpine AS builder
 
 RUN apk update && apk add git && apk add make
