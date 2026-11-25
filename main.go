@@ -129,6 +129,7 @@ func main() {
 		Scheme:        mgr.GetScheme(),
 		LoxiClient:    loxiClient,
 		CertManager:   certManager,
+		Recorder:      mgr.GetEventRecorderFor("loxilb-ingress"),
 		ProgrammedKey: programmedKey,
 	}
 	if err = reconciler.SetupWithManager(mgr); err != nil {

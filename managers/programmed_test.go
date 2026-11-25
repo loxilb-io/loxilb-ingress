@@ -74,7 +74,19 @@ func (f *fakeLoxilb) serve(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		f.rules = append(f.rules, model)
+		// loxilb has one rule per address, port, protocol, host, path and path type. A rule
+		// posted for one that exists replaces it, whatever its name.
+		replaced := false
+		for i := range f.rules {
+			if sameRuleKey(f.rules[i].Service, model.Service) {
+				f.rules[i] = model
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			f.rules = append(f.rules, model)
+		}
 		f.ruleCreates++
 	case req.Method == http.MethodDelete && strings.HasPrefix(req.URL.Path, base+"/name/"):
 		name := strings.TrimPrefix(req.URL.Path, base+"/name/")
@@ -90,6 +102,11 @@ func (f *fakeLoxilb) serve(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]string{"result": "Success"})
+}
+
+func sameRuleKey(a, b loxiapi.LoadBalancerService) bool {
+	return a.ExternalIP == b.ExternalIP && a.Port == b.Port && a.Protocol == b.Protocol &&
+		a.Host == b.Host && a.PathPrefix == b.PathPrefix && a.PathMatchMode == b.PathMatchMode
 }
 
 // serveSNI registers or removes an SNI certificate the way loxilb does, and returns the result.

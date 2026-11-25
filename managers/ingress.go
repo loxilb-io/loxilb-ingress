@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -51,6 +52,8 @@ const (
 	// backendRetryInterval is how soon an Ingress with backends that couldn't be installed
 	// (for example, no endpoints yet) is reconciled again.
 	backendRetryInterval = 5 * time.Second
+	// resyncInterval is how often an Ingress is reconciled when nothing asks for it sooner.
+	resyncInterval = 30 * time.Second
 
 	// defaultInactiveTimeout is the inactivity timeout, in seconds, of the HTTP and HTTPS rules of
 	// an Ingress without the loxilb.io/timeout annotation. It is the default kube-loxilb gives its
@@ -76,6 +79,8 @@ type LoxilbIngressReconciler struct {
 	Scheme      *runtime.Scheme
 	LoxiClient  *loxiapi.LoxiClient
 	CertManager *cert.Manager
+	// Recorder writes the events of an Ingress. Nil disables them.
+	Recorder record.EventRecorder
 	// ProgrammedKey is the annotation key under which this Pod reports the Ingress generation it
 	// has installed (see programmed.go). Empty disables the report.
 	ProgrammedKey string
@@ -148,7 +153,13 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if _, isok := ingress.Annotations["loxilb.io/direct-loadbalance-service"]; isok {
 		models, skipped, err = r.createDirectLoxiModelList(ctx, ingress)
 	} else {
-		models, skipped, err = r.createLoxiModelList(ctx, ingress)
+		// Nothing is installed yet, so a failure here leaves the rules as they are.
+		owners, ownersErr := r.rulePathOwners(ctx)
+		if ownersErr != nil {
+			logger.Error(ownersErr, "failed to set ingress", "Ingress", req.NamespacedName)
+			return ctrl.Result{}, ownersErr
+		}
+		models, skipped, err = r.createLoxiModelList(ctx, ingress, owners)
 	}
 
 	if err != nil {
@@ -167,11 +178,20 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// A path left out for an older Ingress isn't retried: the Ingress is reconciled again when
+	// that Ingress changes. Only backends that aren't ready yet are.
+	conflicts, notReady := splitPathConflicts(skipped)
+	r.reportPathConflicts(ctx, ingress, conflicts)
+	retryAfter := resyncInterval
+	if len(notReady) > 0 {
+		retryAfter = backendRetryInterval
+	}
+
 	if len(models) == 0 && len(skipped) > 0 {
-		// No backend could be installed, so this Pod doesn't serve the Ingress at all.
+		// Nothing could be installed, so this Pod doesn't serve the Ingress at all.
 		r.clearProgrammedOrLog(ctx, ingress)
-		logger.Error(utilerrors.NewAggregate(skipped), "no Ingress backend could be installed. retrying", "Ingress", req.NamespacedName)
-		return ctrl.Result{RequeueAfter: backendRetryInterval}, nil
+		logger.Error(utilerrors.NewAggregate(skipped), "no Ingress path could be installed", "Ingress", req.NamespacedName)
+		return ctrl.Result{RequeueAfter: retryAfter}, nil
 	}
 
 	if err := r.updateIngressStatus(ctx, ingress); err != nil {
@@ -180,20 +200,23 @@ func (r *LoxilbIngressReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Report after the status update: the patch changes the resourceVersion that the status
 	// update relies on. The report covers what was installed; skipped paths can't be served by any
-	// route until their backends are ready.
-	if err := r.markProgrammed(ctx, ingress); err != nil {
+	// route until their backends are ready. A path that an older Ingress serves is different: it
+	// answers with another Ingress's backend, so the Ingress isn't reported.
+	if len(conflicts) > 0 {
+		r.clearProgrammedOrLog(ctx, ingress)
+	} else if err := r.markProgrammed(ctx, ingress); err != nil {
 		logger.Error(err, "failed to report programmed generation", "Ingress", req.NamespacedName, "key", r.ProgrammedKey)
 		return ctrl.Result{}, err
 	}
 
 	if len(skipped) > 0 {
-		logger.Error(utilerrors.NewAggregate(skipped), "some Ingress backends are not installed yet. retrying",
+		logger.Error(utilerrors.NewAggregate(skipped), "some Ingress paths are not installed",
 			"Ingress", req.NamespacedName, "installed", len(models), "skipped", len(skipped))
-		return ctrl.Result{RequeueAfter: backendRetryInterval}, nil
+		return ctrl.Result{RequeueAfter: retryAfter}, nil
 	}
 
 	logger.Info("Ingress reconciled successfully", "ingress", req.NamespacedName)
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: resyncInterval}, nil
 }
 
 func (r *LoxilbIngressReconciler) clearProgrammedOrLog(ctx context.Context, ingress *netv1.Ingress) {
@@ -1067,9 +1090,10 @@ func (r *LoxilbIngressReconciler) createDirectLoxiModelList(ctx context.Context,
 
 // createLoxiModelList builds one rule per Ingress path. A path whose backend can't be resolved yet
 // (no Service, no such port, or no endpoints) is left out and returned in skipped, so that one
-// failing backend doesn't take down the other paths. err is set only for errors that affect the
-// whole Ingress, such as invalid mTLS settings.
-func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingress *netv1.Ingress) (models []loxiapi.LoadBalancerModel, skipped []error, err error) {
+// failing backend doesn't take down the other paths. So is a path whose rule goes to another
+// Ingress according to owners (see pathowners.go); a nil owners leaves no path out for that.
+// err is set only for errors that affect the whole Ingress, such as invalid mTLS settings.
+func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingress *netv1.Ingress, owners map[rulePath]types.NamespacedName) (models []loxiapi.LoadBalancerModel, skipped []error, err error) {
 	models = make([]loxiapi.LoadBalancerModel, 0)
 	selStr, isSel := ingress.Annotations["loxilb.io/epselect"]
 	if !isSel {
@@ -1122,6 +1146,10 @@ func (r *LoxilbIngressReconciler) createLoxiModelList(ctx context.Context, ingre
 
 				loxisvc := r.createLoxiLoadBalancerService(ingress.Namespace, lbName, r.LoxiClient.Host, selStr, security, rule.Host, path.Path, pathType, mtlsFrontend, mtlsBackend)
 				loxisvc.Timeout = timeout
+				if owner, taken := owners[rulePathOf(loxisvc)]; taken && owner != client.ObjectKeyFromObject(ingress) {
+					skipped = append(skipped, &pathConflictError{path: rulePathOf(loxisvc), owner: owner})
+					continue
+				}
 				loxiep, err := r.createLoxiLoadBalancerEndpointsForBackend(ctx, ns, path.Backend.Service)
 				if err != nil {
 					skipped = append(skipped, fmt.Errorf("path %s%s: %w", rule.Host, path.Path, err))
@@ -1309,6 +1337,9 @@ func (r *LoxilbIngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&netv1.Ingress{}, builder.WithPredicates(ingressEvents)).
+		// A change of one Ingress can give a rule to, or take one from, another that asks for the
+		// same host and path.
+		Watches(&netv1.Ingress{}, handler.EnqueueRequestsFromMapFunc(r.ingressesSharingRulePaths), builder.WithPredicates(ingressEvents)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(secretToIngressMapper)).
 		// Backend Pods come and go without the Ingress changing.
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.ingressesForEndpointSlice)).
