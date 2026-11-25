@@ -277,7 +277,7 @@ $ kubectl get ingress site -o jsonpath='{.metadata.generation}{"\n"}{.metadata.a
 
 Here `loxilb-ingress-x7k2p` serves the current spec, and `loxilb-ingress-m4q9z` hasn't installed it yet.
 
-* The value is written only after the rules are installed. If some paths' backends can't be resolved yet (no Service, no such port, or no endpoints), the other paths are installed and the value is written; those paths can't be served until their backends are ready. A Pod removes its annotation when it can't install any path of the Ingress, or when it removes the rules.
+* The value is written only after the rules are installed. If some paths' backends can't be resolved yet (no Service, no such port, or no endpoints), the other paths are installed and the value is written; those paths can't be served until their backends are ready. A Pod removes its annotation when it can't install any path of the Ingress, when a path of the Ingress is served by an older Ingress (see [Ingresses with the same host and path](#ingresses-with-the-same-host-and-path)), or when it removes the rules.
 * When a container restarts, it removes its annotations at startup and writes them again after it reinstalls the rules. Annotations of Pods that no longer exist are left in place.
 * Pods that report carry the label `loxilb.io/programmed-report: "v1"`. Reporting needs the `POD_NAME` env and `patch` on `ingresses`, both in [manifests/loxilb-ingress-deploy.yml](manifests/loxilb-ingress-deploy.yml).
 * The Pod name must be 52 characters or shorter, because the part of the key after `loxilb.io/` can be at most 63 characters. A Pod with a longer name logs an error and doesn't report.
@@ -287,6 +287,16 @@ Here `loxilb-ingress-x7k2p` serves the current spec, and `loxilb-ingress-m4q9z` 
 * A path whose backend can't be resolved yet is left out, and the other paths of the Ingress stay installed. The Ingress is reconciled again every 5 seconds until all of its paths are installed.
 * A loxilb-ingress Pod becomes Ready once its loxilb answers and every loxilb Ingress that existed when the controller started has been reconciled once. An Ingress that fails counts once it has been tried, so it doesn't keep Pods NotReady. The check is served at `:8081/readyz` and used by the `readinessProbe` in [manifests/loxilb-ingress-deploy.yml](manifests/loxilb-ingress-deploy.yml).
 * When the Pods behind a backend Service change, the Ingresses that use the Service are reconciled right away. Every Ingress is also reconciled every 30 seconds.
+
+## Ingresses with the same host and path
+
+loxilb has one rule per port, host, path and path type. A Pod puts the HTTP rules of every Ingress on port 80 and the HTTPS rules on port 443, so two Ingresses with the same host, path and path type on a port ask for the same rule. The rule goes to the oldest of them (by creation time, then namespace and name).
+
+* The other Ingress leaves that path out and installs its other paths. It gets a `PathConflict` Warning event that names the Ingress serving the path, and it isn't reported as programmed.
+* When the Ingress that has the rule is deleted or no longer asks for the path, the next oldest gets the rule right away.
+* The oldest Ingress keeps the path also while its backend isn't ready. The path then isn't served.
+* The same path with another path type, or on the other port (one Ingress with TLS for the host and one without), is another rule.
+* Ingresses are told apart by port, host and path only. Ingresses that kube-loxilb makes for different Gateways share the Pod's two ports, so they conflict in the same way.
 
 ## Inactivity timeout
 
