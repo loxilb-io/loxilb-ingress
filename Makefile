@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := build
 bin=loxilb-ingress
 TAG?=latest
-LOXILB_IMG?=ghcr.io/loxilb-io/loxilb-inference-gateway:v0.9.9.1
+LOXILB_IMG?=ghcr.io/loxilb-io/loxilb-inference-gateway:v0.9.9.2
 
 build:
 	@mkdir -p ./bin
