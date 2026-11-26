@@ -313,7 +313,7 @@ metadata:
 * kube-loxilb copies the annotations of an HTTPRoute to the Ingress it makes for it, so the annotation can be set on the HTTPRoute.
 * Rules of a `loxilb.io/direct-loadbalance-service` Ingress are not affected. They keep loxilb's own default.
 
-**Limitation: the value is per port, not per Ingress.** loxilb (v0.9.9.1, the current base image) doesn't take the timeout of a connection from the rule that serves it. When it accepts a connection, it takes the timeout of the oldest rule on the port. All HTTP rules of a Pod are on port 80 and all HTTPS rules are on port 443, so:
+**Limitation: the value is per port, not per Ingress.** loxilb (v0.9.9.2, the current base image) doesn't take the timeout of a connection from the rule that serves it. When it accepts a connection, it takes the timeout of the oldest rule on the port. All HTTP rules of a Pod are on port 80 and all HTTPS rules are on port 443, so:
 
 * The annotation of an Ingress applies to every connection on the port while that Ingress has the oldest rule there. Otherwise it applies to none, also not to the Ingress's own connections.
 * Changing the annotation installs the rules of the Ingress again, which makes them the newest on the port. The new value then usually doesn't apply.
@@ -330,15 +330,17 @@ loxilb keeps one certificate per host. loxilb-ingress writes the certificate of 
 
 ## Wildcard hosts
 
-loxilb-ingress passes the host of an Ingress rule and of `spec.tls` to loxilb as it is written. What a wildcard host such as `*.example.com` matches is therefore decided by the loxilb in the image, not by the Ingress specification:
+loxilb-ingress passes the host of an Ingress rule and of `spec.tls` to loxilb as it is written. What a wildcard host such as `*.example.com` matches is therefore decided by loxilb, not by the Ingress specification:
 
 | | `a.example.com` | `a.b.example.com` | `example.com` |
 | --- | --- | --- | --- |
 | Kubernetes Ingress specification | matches | doesn't match | doesn't match |
-| loxilb (Gateway API meaning) | matches | matches | doesn't match |
+| loxilb, routing a request by its host | matches | matches | doesn't match |
+| loxilb, selecting a certificate by SNI | matches | doesn't match | doesn't match |
 
-* With loxilb, a wildcard host matches more than one label, so an Ingress with `*.example.com` also receives requests for `a.b.example.com`.
-* Wildcard hosts need a loxilb that supports them. The current base image (`loxilb-inference-gateway:v0.9.9.1`) doesn't route by a wildcard host and doesn't select a wildcard certificate by SNI.
+* **Routing.** A wildcard host matches one or more labels (the Gateway API meaning), so an Ingress with `*.example.com` also receives requests for `a.b.example.com`. The paths of an Ingress with the exact host are tried first: a request for `a.example.com` goes to the Ingress with `*.example.com` only when no path of an Ingress with the host `a.example.com` matches it.
+* **Certificates.** The certificate of the `spec.tls` host `*.example.com` is served to connections for `a.example.com`, unless `a.example.com` has a certificate of its own. A connection for `a.b.example.com` gets the certificate of the port's listener instead, as a host without a certificate does (see [TLS certificates](#tls-certificates)). Its requests still go to the Ingress with `*.example.com`.
+* Wildcard hosts need the base image `loxilb-inference-gateway:v0.9.9.2` or newer. With an older base the rule of a wildcard host is installed, but no request matches it and its certificate is never served.
 
 ## Backends in other namespaces
 
