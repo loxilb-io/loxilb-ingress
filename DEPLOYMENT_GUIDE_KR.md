@@ -64,11 +64,13 @@ minica --domains='*.loxilb.io'
 
 #### 2.2 Kubernetes Secret 생성
 
+DaemonSet은 `kube-system`의 Secret `loxilb-ssl`에서 `server.crt`와 `server.key` 키를 loxilb의 기본 인증서(`/opt/loxilb/cert/server.crt`, `server.key`)로 마운트합니다. Secret은 이 두 키 이름으로 만드세요.
+
 **방법 1: kubectl 명령 사용 (권장)**
 ```bash
-kubectl create secret tls loxilb-ssl \
-  --cert=server.crt \
-  --key=server.key \
+kubectl create secret generic loxilb-ssl \
+  --from-file=server.crt=server.crt \
+  --from-file=server.key=server.key \
   -n kube-system
 ```
 
@@ -85,22 +87,26 @@ kind: Secret
 metadata:
   name: loxilb-ssl
   namespace: kube-system
-type: kubernetes.io/tls
+type: Opaque
 data:
-  tls.crt: <base64-encoded-certificate>
-  tls.key: <base64-encoded-key>
+  server.crt: <base64-encoded-certificate>
+  server.key: <base64-encoded-key>
 ```
 
-**방법 3: Opaque Secret 사용**
+> **참고:**
+> - 키 이름이 다르면 loxilb에 기본 인증서가 없습니다. 예를 들어 `kubectl create secret tls`는 `tls.crt`와 `tls.key` 키를 만듭니다. 이때 Pod는 오류 없이 시작하지만, Pod 안의 두 경로는 빈 디렉토리가 됩니다. 그러면 자기 인증서가 없는 호스트의 HTTPS 규칙이 그 포트의 첫 규칙일 때 loxilb가 그 규칙을 거부합니다.
+> - 실행 중인 Pod는 시작할 때의 파일을 그대로 씁니다. 기본 인증서를 바꾸려면 Secret을 수정한 뒤 Pod를 다시 시작하세요: `kubectl rollout restart daemonset loxilb-ingress -n kube-system`
 
-loxilb-ingress는 `kubernetes.io/tls` 타입 외에도 `Opaque` 타입 Secret을 지원합니다:
+**Ingress의 Secret**
+
+Ingress가 `spec.tls`에 적는 Secret은 `kubernetes.io/tls` 타입과 `Opaque` 타입을 모두 쓸 수 있습니다:
 
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
-  name: loxilb-ssl
-  namespace: kube-system
+  name: example-tls
+  namespace: default
 type: Opaque
 data:
   cert: <base64-encoded-certificate>
