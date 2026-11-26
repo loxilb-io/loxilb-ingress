@@ -64,11 +64,13 @@ minica --domains='*.loxilb.io'
 
 #### 2.2 Create Kubernetes Secret
 
+The DaemonSet mounts the keys `server.crt` and `server.key` of the Secret `loxilb-ssl` in `kube-system` as loxilb's default certificate (`/opt/loxilb/cert/server.crt` and `server.key`). Create the Secret with these two key names.
+
 **Method 1: Using kubectl command (Recommended)**
 ```bash
-kubectl create secret tls loxilb-ssl \
-  --cert=server.crt \
-  --key=server.key \
+kubectl create secret generic loxilb-ssl \
+  --from-file=server.crt=server.crt \
+  --from-file=server.key=server.key \
   -n kube-system
 ```
 
@@ -85,22 +87,26 @@ kind: Secret
 metadata:
   name: loxilb-ssl
   namespace: kube-system
-type: kubernetes.io/tls
+type: Opaque
 data:
-  tls.crt: <base64-encoded-certificate>
-  tls.key: <base64-encoded-key>
+  server.crt: <base64-encoded-certificate>
+  server.key: <base64-encoded-key>
 ```
 
-**Method 3: Using Opaque Secret**
+> **Note:**
+> - With other key names, loxilb has no default certificate. `kubectl create secret tls`, for example, makes the keys `tls.crt` and `tls.key`: the Pod starts without an error, but the two paths are empty directories in it. loxilb then refuses an HTTPS rule whose host has no certificate of its own when that rule is the first on its port.
+> - A running Pod keeps the files it started with. To change the default certificate, update the Secret and restart the Pods: `kubectl rollout restart daemonset loxilb-ingress -n kube-system`.
 
-loxilb-ingress supports `Opaque` type secrets in addition to `kubernetes.io/tls`:
+**Secrets of an Ingress**
+
+A Secret that an Ingress names under `spec.tls` can be of type `kubernetes.io/tls` or `Opaque`:
 
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
-  name: loxilb-ssl
-  namespace: kube-system
+  name: example-tls
+  namespace: default
 type: Opaque
 data:
   cert: <base64-encoded-certificate>
